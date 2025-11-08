@@ -1,5 +1,5 @@
-# app.py — AI Search Log Intelligence (Custom Schema Adapted to Vodafone-Style Logs)
-# Works with columns: Time, Time_parsed, Date, HourBucket, PathClean, User-Agent, Status
+# app.py — AI Search Log Intelligence (Fuzzy Column Detection)
+# Compatible with Vodafone-style log exports (handles Time, Time_pars, Date, HourBucket variants)
 
 import streamlit as st
 import pandas as pd
@@ -24,16 +24,17 @@ BOT_SIGNATURES = {
     "PerplexityBot": [r"perplexity(bot|ai|search)", r"perplexity\-bot"],
     "Perplexity-User": [r"perplexity[-_ ]?user"],
     "OAI-SearchBot": [r"oai[-_ ]?search", r"openai[-_ ]?search"],
+    "Applebot": [r"applebot"],
     "CCBot": [r"commoncrawl|ccbot"],
     "Bytespider": [r"bytespider"],
     "AhrefsBot": [r"ahrefs"],
     "SemrushBot": [r"semrush"],
-    "Applebot": [r"applebot"],
     "Other AI": [r"mistral", r"anthropic", r"llm"],
     "Unclassified": [r".*"],
 }
 
 _COMPILED = [(b, [re.compile(p, re.I) for p in pats]) for b, pats in BOT_SIGNATURES.items()]
+
 
 def identify_bot(ua: str) -> str:
     if pd.isna(ua):
@@ -45,8 +46,10 @@ def identify_bot(ua: str) -> str:
                 return bot
     return "Unclassified"
 
+
 def is_ai_bot(bot: str) -> bool:
     return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider", "ccbot", "applebot"])
+
 
 # ----------------------------------------------------------
 # STYLE
@@ -65,6 +68,7 @@ BOT_COLOR_MAP = {
     "Unclassified": "#8c8c8c",
 }
 
+
 def style_plot(fig, title):
     fig.update_layout(
         title=title,
@@ -77,6 +81,7 @@ def style_plot(fig, title):
     fig.update_xaxes(showgrid=True, gridcolor="#2a2d35", tickformat="%b %d")
     fig.update_yaxes(showgrid=True, gridcolor="#2a2d35", zeroline=False)
     return fig
+
 
 # ----------------------------------------------------------
 # HELPERS
@@ -97,11 +102,20 @@ def downsample(df, max_points=500):
     step = int(np.ceil(len(df) / max_points))
     return df.iloc[::step, :]
 
+
+def find_fuzzy_col(columns, patterns):
+    for c in columns:
+        for p in patterns:
+            if p in c:
+                return c
+    return None
+
+
 # ----------------------------------------------------------
 # APP HEADER
 # ----------------------------------------------------------
 st.title("AI Search Log Intelligence")
-st.caption("Vodafone-style log schema optimized for bot crawl intelligence analysis.")
+st.caption("Adaptive schema detection for Vodafone-style log exports.")
 
 uploaded = st.file_uploader("Upload your log file (CSV or Excel)", type=["csv", "xlsx", "xls"])
 if not uploaded:
@@ -115,47 +129,54 @@ if not uploaded:
 def load_and_process(file):
     name = file.name.lower()
     df = pd.read_csv(file, low_memory=False) if name.endswith(".csv") else pd.read_excel(file)
-    df.columns = [c.strip().replace(" ", "_") for c in df.columns]
+    df.columns = [c.strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]
 
-    # Choose best timestamp column
-    time_col = None
-    for candidate in ["time", "time_parsed", "date", "hourbucket"]:
-        if candidate.lower() in df.columns:
-            time_col = candidate
-            break
+    # --- DEBUG COLUMN OUTPUT ---
+    st.write("Detected columns:", df.columns.tolist())
+
+    # Detect timestamp column with fuzzy matching
+    time_col = find_fuzzy_col(df.columns, ["time_pars", "time", "date", "hourbuck"])
     if not time_col:
-        raise ValueError("No recognizable time/date column found (expected: Time, Time_parsed, Date, or HourBucket).")
+        raise ValueError("No recognizable time/date column found (checked partials: time_pars, time, date, hourbuck).")
 
-    # Parse date with coercion
+    # Parse timestamp robustly
     df["date"] = pd.to_datetime(df[time_col], errors="coerce", dayfirst=True)
     df.dropna(subset=["date"], inplace=True)
     df["date_bucket"] = df["date"].dt.floor("D")
 
-    # Rename for standardization
+    # Rename columns
     rename_map = {}
     if "pathclean" in df.columns:
         rename_map["pathclean"] = "url"
     elif "path" in df.columns:
         rename_map["path"] = "url"
-    if "user-agent" in df.columns:
-        rename_map["user-agent"] = "user_agent"
-    elif "user_agent" not in df.columns and "useragent" in df.columns:
-        rename_map["useragent"] = "user_agent"
+    if "user_agent" not in df.columns:
+        if "user_agent" in df.columns:
+            pass
+        elif "useragent" in df.columns:
+            rename_map["useragent"] = "user_agent"
+        elif "user_agent" not in df.columns and "user_agent" not in rename_map:
+            rename_map["user-agent"] = "user_agent"
+    if "status" not in df.columns:
+        raise ValueError("Missing 'Status' column.")
+
     df.rename(columns=rename_map, inplace=True)
 
-    # Ensure required fields exist
+    # Required fields
     required = ["date", "url", "status", "user_agent"]
     for r in required:
         if r not in df.columns:
             raise ValueError(f"Missing required column: {r}")
 
+    # Type fixes
     df["status"] = df["status"].astype(str).str.strip()
     df["is_content_page"] = df["url"].apply(is_content_url)
     df["bot_normalized"] = df["user_agent"].apply(identify_bot)
     df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
     df["is_visible"] = df["status"].isin(["200", "304"])
-
     return df
+
 
 try:
     df = load_and_process(uploaded)
@@ -263,5 +284,5 @@ st.markdown("""
 **Visibility Ratio** = (Visible hits ÷ AI hits) × 100  
 
 Focus on 200/304 for true visibility.  
-AI and LLM crawler overlaps suggest data entering training ecosystems.
+AI crawler activity signals content exposure to model training ecosystems.
 """)
