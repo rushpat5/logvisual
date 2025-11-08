@@ -1,6 +1,6 @@
-# app.py — AI Search Log Intelligence (compatible with detailed_hits.csv)
-# Author: [Your Name]
-# Version: 3.0
+# app.py — AI Search Log Intelligence (Stable Final)
+# Compatible with detailed_hits.csv
+# Version: 3.1
 
 import streamlit as st
 import pandas as pd
@@ -32,7 +32,7 @@ BOT_SIGNATURES = {
     "Unclassified": [r".*"],
 }
 
-_COMPILED_PATTERNS = [(bot, [re.compile(p, re.I) for p in patterns]) for bot, patterns in BOT_SIGNATURES.items()]
+_COMPILED_PATTERNS = [(b, [re.compile(p, re.I) for p in pats]) for b, pats in BOT_SIGNATURES.items()]
 
 def identify_bot(ua: str) -> str:
     if pd.isna(ua):
@@ -51,23 +51,16 @@ def is_ai_bot(bot_name: str) -> bool:
 # HEADER
 # ---------------------------------------------
 st.title("AI Search Visibility Intelligence")
-st.caption("Log-file–driven visibility analysis for AI crawlers and content coverage")
+st.caption("Server-log–driven analysis of AI crawler behavior and content visibility")
 
 # ---------------------------------------------
 # FILE UPLOAD
 # ---------------------------------------------
-uploaded = st.file_uploader(
-    "Upload your detailed_hits.csv or equivalent log extract",
-    type=["csv", "xlsx", "xls"]
-)
-
+uploaded = st.file_uploader("Upload detailed_hits.csv (or similar structured log)", type=["csv", "xlsx", "xls"])
 if not uploaded:
-    st.info("Upload your log file to begin.")
+    st.info("Upload your log file to continue.")
     st.stop()
 
-# ---------------------------------------------
-# READ FILE
-# ---------------------------------------------
 def read_input(file):
     name = file.name.lower()
     try:
@@ -76,23 +69,56 @@ def read_input(file):
         else:
             df = pd.read_excel(file)
     except Exception as e:
-        st.error(f"Failed to read file: {e}")
+        st.error(f"File read error: {e}")
         st.stop()
     return df
 
 df = read_input(uploaded)
 
-# Normalize columns
-df.columns = [c.strip().replace(" ", "_").lower() for c in df.columns]
+# ---------------------------------------------
+# COLUMN NORMALIZATION
+# ---------------------------------------------
+df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-# Expected columns from detailed_hits.csv
-expected = ["time_parsed", "pathclean", "status", "user-agent"]
-missing = [c for c in expected if c not in df.columns]
+# Defensive drop: keep only one datetime source
+if "time_parsed" in df.columns:
+    df = df.drop(columns=[c for c in ["time", "date", "hourbucket"] if c in df.columns], errors="ignore")
+    df = df.rename(columns={"time_parsed": "date"})
+elif "time" in df.columns:
+    df = df.drop(columns=[c for c in ["date", "time_parsed", "hourbucket"] if c in df.columns], errors="ignore")
+    df = df.rename(columns={"time": "date"})
+elif "date" in df.columns:
+    pass
+else:
+    st.error("No valid time column found (expected one of: Time_parsed, Time, or Date).")
+    st.stop()
+
+# Defensive renaming for URL & UA
+rename_map = {}
+if "pathclean" in df.columns:
+    rename_map["pathclean"] = "url"
+elif "path" in df.columns:
+    rename_map["path"] = "url"
+
+if "user-agent" in df.columns:
+    rename_map["user-agent"] = "user_agent"
+elif "user_agent" not in df.columns and "useragent" in df.columns:
+    rename_map["useragent"] = "user_agent"
+
+if rename_map:
+    df = df.rename(columns=rename_map)
+
+# Check required
+required = ["date", "url", "status", "user_agent"]
+missing = [r for r in required if r not in df.columns]
 if missing:
     st.error(f"Missing required columns: {', '.join(missing)}")
     st.stop()
 
-df = df.rename(columns={"time_parsed": "date", "pathclean": "url", "user-agent": "user_agent"})
+# ---------------------------------------------
+# CLEANUP & TYPES
+# ---------------------------------------------
+df = df.loc[:, ~df.columns.duplicated()]
 df["date"] = pd.to_datetime(df["date"], errors="coerce")
 df = df.dropna(subset=["date"])
 df["date_only"] = df["date"].dt.date
@@ -107,7 +133,7 @@ df["is_visible"] = df["status"].isin(["200", "304"])
 df["is_content_page"] = ~df["url"].str.contains(r"\.(js|css|png|jpg|jpeg|svg|gif|woff|ttf|ico)$", case=False, na=False)
 
 # ---------------------------------------------
-# SIDEBAR FILTERS
+# FILTERS
 # ---------------------------------------------
 st.sidebar.header("Filters")
 
@@ -124,14 +150,13 @@ status_filter = st.sidebar.multiselect(
 )
 df = df[df["status"].isin(status_filter)]
 
-show_content_only = st.sidebar.checkbox("Show content pages only (exclude assets)", value=True)
-if show_content_only:
+if st.sidebar.checkbox("Show only content pages (exclude assets)", value=True):
     df = df[df["is_content_page"]]
 
 total_known_pages = st.sidebar.number_input("Total known content pages (for coverage ratio)", min_value=1, value=10000)
 
 # ---------------------------------------------
-# KEY METRICS
+# METRICS
 # ---------------------------------------------
 total_hits = len(df)
 unique_bots = df["bot_normalized"].nunique()
@@ -152,7 +177,7 @@ c6.metric("AI Coverage Ratio", f"{coverage_ratio:.2f}%")
 st.markdown("---")
 
 # ---------------------------------------------
-# VISUALIZATIONS
+# VISUALS
 # ---------------------------------------------
 st.subheader("Crawl Trend by Bot Type")
 trend = df.groupby(["date_only", "bot_normalized"]).size().reset_index(name="hits")
@@ -160,22 +185,22 @@ fig_trend = px.line(trend, x="date_only", y="hits", color="bot_normalized", titl
 fig_trend.update_layout(height=420, plot_bgcolor="white")
 st.plotly_chart(fig_trend, use_container_width=True)
 
-st.subheader("AI vs Traditional Crawlers Over Time")
+st.subheader("AI vs Traditional Crawlers")
 ai_trend = df.groupby(["date_only", "is_ai_bot"]).size().reset_index(name="hits")
 ai_trend["bot_type"] = np.where(ai_trend["is_ai_bot"], "AI Bots", "Traditional")
 fig_ai = px.area(ai_trend, x="date_only", y="hits", color="bot_type", title="AI vs Traditional Crawl Volume")
 fig_ai.update_layout(height=400, plot_bgcolor="white")
 st.plotly_chart(fig_ai, use_container_width=True)
 
-st.subheader("Top 15 Crawlers by Hit Volume")
+st.subheader("Top Crawlers by Hit Volume")
 bot_summary = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
 fig_bot = px.bar(bot_summary.head(15), x="hits", y="bot_normalized", orientation="h",
-                 labels={"bot_normalized": "Bot", "hits": "Hits"}, title="Top Crawlers")
+                 labels={"bot_normalized": "Bot", "hits": "Hits"}, title="Top 15 Crawlers")
 fig_bot.update_layout(yaxis=dict(autorange="reversed"), height=420, plot_bgcolor="white")
 st.plotly_chart(fig_bot, use_container_width=True)
 
 # ---------------------------------------------
-# AI COVERAGE ACROSS URLS
+# AI COVERAGE
 # ---------------------------------------------
 st.subheader("Top AI-Crawled URLs")
 ai_urls = df[df["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sort_values("hits", ascending=False)
@@ -195,13 +220,14 @@ fig_status.update_layout(barmode="stack", height=520, plot_bgcolor="white")
 st.plotly_chart(fig_status, use_container_width=True)
 
 # ---------------------------------------------
-# INSIGHT SECTION
+# NOTES
 # ---------------------------------------------
 st.markdown("---")
 st.subheader("Interpretation Guide")
 st.markdown("""
 **Coverage Ratio** = (AI-crawled pages ÷ total known pages) × 100  
 **Visibility Ratio** = (Clicks ÷ AI hits) × 100  
-Focus analysis on 200/304 responses for real visibility.
-AI bot crawl frequency ≠ citation frequency — consistent presence implies model familiarity.
+
+Focus on 200/304 for true visibility.  
+Multiple bot types indicate layered discovery — AI bots imply your pages are entering model training pipelines.
 """)
