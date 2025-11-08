@@ -1,8 +1,6 @@
-# ==========================================================
-# Unified AI Search Log Intelligence (Final Stable Build)
-# Author: [You]
-# Date: 2025-11-08
-# ==========================================================
+# Log_App.py — Final: Explicit totals + filtered metrics + diagnostics
+# Stable, defensive, and transparent: totals always match raw file; filtered metrics shown separately.
+# Use this as your Streamlit app.
 
 import streamlit as st
 import pandas as pd
@@ -10,16 +8,16 @@ import numpy as np
 import re
 import plotly.express as px
 
-# ----------------------------------------------------------
-# PAGE CONFIGURATION
-# ----------------------------------------------------------
+# -----------------------
+# Page config
+# -----------------------
 st.set_page_config(page_title="AI Search Log Intelligence", layout="wide")
 st.title("AI Search Log Intelligence")
-st.caption("Analyze AI and traditional crawler behavior using Vodafone-style access logs.")
+st.caption("Totals always reflect the uploaded file. Filtered metrics are shown separately with diagnostics.")
 
-# ----------------------------------------------------------
-# BOT SIGNATURES
-# ----------------------------------------------------------
+# -----------------------
+# Bot signatures
+# -----------------------
 BOT_SIGNATURES = {
     "Googlebot": [r"googlebot"],
     "Bingbot": [r"bingbot|msnbot"],
@@ -35,53 +33,27 @@ BOT_SIGNATURES = {
     "Bytespider": [r"bytespider"],
     "Unclassified": [r".*"],
 }
-_COMPILED = [(b, [re.compile(p, re.I) for p in pats]) for b, pats in BOT_SIGNATURES.items()]
+_COMPILED = [(k, [re.compile(p, re.I) for p in v]) for k, v in BOT_SIGNATURES.items()]
 
 def identify_bot(ua: str) -> str:
     if pd.isna(ua):
         return "Unclassified"
     ua = str(ua)
-    for bot, plist in _COMPILED:
-        for pat in plist:
-            if pat.search(ua):
+    for bot, pats in _COMPILED:
+        for p in pats:
+            if p.search(ua):
                 return bot
     return "Unclassified"
 
-def is_ai_bot(bot: str) -> bool:
-    return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider"])
+def is_ai_bot(bot_name: str) -> bool:
+    if pd.isna(bot_name):
+        return False
+    b = str(bot_name).lower()
+    return any(x in b for x in ("gpt", "claude", "perplexity", "oai", "bytespider"))
 
-# ----------------------------------------------------------
-# VISUAL STYLE
-# ----------------------------------------------------------
-BOT_COLOR_MAP = {
-    "Googlebot": "#00c853",
-    "Bingbot": "#2979ff",
-    "GPTBot": "#a970ff",
-    "ChatGPT-User": "#9370db",
-    "ClaudeBot": "#ffb347",
-    "PerplexityBot": "#00e5c0",
-    "Perplexity-User": "#00bfa5",
-    "OAI-SearchBot": "#ff5252",
-    "Applebot": "#d4af37",
-    "Unclassified": "#8c8c8c",
-}
-
-def style_plot(fig, title):
-    fig.update_layout(
-        title=title,
-        template="plotly_dark",
-        paper_bgcolor="#0f1116",
-        plot_bgcolor="#0f1116",
-        font=dict(color="#e0e0e0", size=13),
-        margin=dict(t=60, b=60, l=60, r=40),
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="#2a2d35")
-    fig.update_yaxes(showgrid=True, gridcolor="#2a2d35", zeroline=False)
-    return fig
-
-# ----------------------------------------------------------
-# HELPER FUNCTIONS
-# ----------------------------------------------------------
+# -----------------------
+# Helpers
+# -----------------------
 ASSET_PATTERN = re.compile(
     r"\.(?:js|css|png|jpg|jpeg|gif|ico|woff2?|ttf|svg)(?:\?|$)", re.IGNORECASE
 )
@@ -91,209 +63,265 @@ def is_content_url(url: str) -> bool:
         return False
     return not bool(ASSET_PATTERN.search(str(url).lower()))
 
+def find_time_column(cols):
+    # fuzzy search for likely time columns (prefer full ISO-like 'time')
+    candidates = ["time", "time_parsed", "timestamp", "datetime", "date", "hourbucket"]
+    for cand in candidates:
+        for c in cols:
+            if cand in c:
+                return c
+    # fallback to first column that contains 'time'/'date' substring
+    for c in cols:
+        if "time" in c or "date" in c:
+            return c
+    return None
+
 def normalize_datetime(series):
     s = pd.to_datetime(series, errors="coerce", utc=True)
+    # keep NaT for truly invalid values; do NOT forward fill here
     return s.dt.tz_localize(None)
 
 def downsample(df, max_points=1000):
     if len(df) <= max_points:
         return df
     step = int(np.ceil(len(df) / max_points))
-    return df.iloc[::step, :]
+    return df.iloc[::step, :].copy()
 
-# ----------------------------------------------------------
-# FILE UPLOAD
-# ----------------------------------------------------------
+# -----------------------
+# File upload
+# -----------------------
 uploaded = st.file_uploader("Upload your log file (.csv or .xlsx)", type=["csv", "xlsx", "xls"])
 if not uploaded:
-    st.info("Upload a log file to continue.")
+    st.info("Upload a file to begin.")
     st.stop()
 
-# ----------------------------------------------------------
-# LOAD DATA
-# ----------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def load_and_prepare(file):
+def load_data(file):
     name = file.name.lower()
     df = pd.read_csv(file, low_memory=False) if name.endswith(".csv") else pd.read_excel(file)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    # normalize column names (strip, lowercase, replace spaces/hyphens)
+    df.columns = [str(c).strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
+    # drop duplicate column names (keep first)
     df = df.loc[:, ~df.columns.duplicated()]
-
-    # Find date column
-    time_candidates = ["time", "time_parsed", "date", "hourbucket"]
-    time_col = next((c for c in time_candidates if c in df.columns), None)
-    if not time_col:
-        raise ValueError("No recognizable time/date column found (expected: Time, Time_parsed, Date, or HourBucket).")
-
-    df["date"] = normalize_datetime(df[time_col])
-    df["date_bucket"] = df["date"].dt.floor("D")
-
-    # Normalize URLs and UA
-    if "pathclean" in df.columns:
-        df.rename(columns={"pathclean": "url"}, inplace=True)
-    elif "path" in df.columns:
-        df.rename(columns={"path": "url"}, inplace=True)
-
-    if "user_agent" not in df.columns:
-        if "user-agent" in df.columns:
-            df.rename(columns={"user-agent": "user_agent"}, inplace=True)
-
-    if "status" not in df.columns:
-        raise ValueError("Missing 'Status' column.")
-
-    # Enrich data
-    df["is_content_page"] = df["url"].apply(is_content_url)
-    df["status"] = df["status"].astype(str)
-    df["bot_normalized"] = df["user_agent"].apply(identify_bot)
-    df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
-    df["is_visible"] = df["status"].isin(["200", "304"])
-
     return df
 
 try:
-    df_raw = load_and_prepare(uploaded)
+    df_raw = load_data(uploaded)
 except Exception as e:
-    st.error(f"Failed to load file: {e}")
+    st.error(f"Failed to read file: {e}")
     st.stop()
 
-total_rows = len(df_raw)
+# show detected columns for transparency
+st.subheader("File schema (detected columns)")
+st.write(list(df_raw.columns))
 
-# ----------------------------------------------------------
-# FILTERS
-# ----------------------------------------------------------
+# -----------------------
+# Ensure required fields exist (or map)
+# -----------------------
+# map common names to canonical names if present
+rename_map = {}
+if "pathclean" in df_raw.columns:
+    rename_map["pathclean"] = "url"
+elif "path" in df_raw.columns:
+    rename_map["path"] = "url"
+
+if "user_agent" not in df_raw.columns and "user-agent" in df_raw.columns:
+    rename_map["user-agent"] = "user_agent"
+if rename_map:
+    df_raw = df_raw.rename(columns=rename_map)
+
+# check for minimal required columns
+required = ["url", "status", "user_agent"]
+missing_required = [c for c in required if c not in df_raw.columns]
+if missing_required:
+    st.error(f"Missing required columns in uploaded file: {missing_required}. The app requires these columns.")
+    st.stop()
+
+# -----------------------
+# Timestamp parsing (do not drop rows)
+# -----------------------
+time_col = find_time_column(df_raw.columns)
+if not time_col:
+    st.error("No recognizable time/date column found. Expected names containing: time, time_parsed, timestamp, datetime, date, hourbucket.")
+    st.stop()
+
+# create parsed date column (may contain NaT)
+df_raw["date"] = normalize_datetime(df_raw[time_col])
+# date_bucket for day-level grouping (NaT remains NaT)
+df_raw["date_bucket"] = df_raw["date"].dt.floor("D")
+
+# mark which rows have valid date for filtering/plots
+df_raw["has_valid_date"] = ~df_raw["date"].isna()
+
+# -----------------------
+# Enrichment (no drops)
+# -----------------------
+df_raw["is_content_page"] = df_raw["url"].apply(is_content_url)
+df_raw["status"] = df_raw["status"].astype(str)
+df_raw["bot_normalized"] = df_raw["user_agent"].apply(identify_bot)
+df_raw["is_ai_bot"] = df_raw["bot_normalized"].apply(is_ai_bot)
+df_raw["is_visible"] = df_raw["status"].isin(["200", "304"])
+
+# -----------------------
+# Diagnostics: raw counts
+# -----------------------
+total_rows = len(df_raw)
+rows_with_date = df_raw["has_valid_date"].sum()
+rows_without_date = total_rows - rows_with_date
+
+st.success(f"Loaded {total_rows:,} rows. {rows_with_date:,} rows contain parseable timestamps; {rows_without_date:,} rows have invalid/missing timestamps (kept).")
+
+# show distribution of date buckets (helpful to spot rows outside slider)
+st.write("Date buckets (counts) — NaT indicates missing/unparseable timestamps:")
+date_counts = df_raw["date_bucket"].astype(str).value_counts(dropna=False).sort_index()
+st.dataframe(date_counts.rename_axis("date_bucket").reset_index(name="count"))
+
+# -----------------------
+# Sidebar filters
+# -----------------------
 st.sidebar.header("Filters")
 
-min_date, max_date = df_raw["date_bucket"].min().date(), df_raw["date_bucket"].max().date()
-date_range = st.sidebar.date_input("Date Range", (min_date, max_date), min_value=min_date, max_value=max_date)
-show_content_only = st.sidebar.checkbox("Show only content pages (exclude assets)", value=False)
+# build date slider domain from only parseable dates
+if rows_with_date > 0:
+    min_date = df_raw.loc[df_raw["has_valid_date"], "date_bucket"].min().date()
+    max_date = df_raw.loc[df_raw["has_valid_date"], "date_bucket"].max().date()
+else:
+    # no valid dates—default to today
+    min_date = pd.Timestamp.utcnow().date()
+    max_date = min_date
 
-# Apply filters to a copy for visuals
+date_range = st.sidebar.date_input("Date Range (applies only to rows with parseable timestamps)", (min_date, max_date), min_value=min_date, max_value=max_date)
+show_content_only = st.sidebar.checkbox("Show only content pages (exclude assets)", value=False)
+top_n_bots = st.sidebar.number_input("Top N bots/URLs (for bar charts)", min_value=5, max_value=100, value=15)
+
+# -----------------------
+# Build filtered dataframe (only for visuals/filtered metrics)
+# - Do NOT mutate df_raw.
+# - Rows with no parseable date are excluded from date filtering, but they remain in raw totals.
+# -----------------------
 df_filtered = df_raw.copy()
 
+# apply date filter only to rows that have valid dates; invalid-date rows are excluded from visual dataset unless we choose to include them separately.
+start_date, end_date = None, None
 if isinstance(date_range, tuple) and len(date_range) == 2:
-    start, end = [pd.to_datetime(d).tz_localize(None) for d in date_range]
-    df_filtered = df_filtered[(df_filtered["date_bucket"] >= start) & (df_filtered["date_bucket"] <= end)]
+    start_date = pd.to_datetime(date_range[0]).tz_localize(None)
+    end_date = pd.to_datetime(date_range[1]).tz_localize(None)
+    # mask: has_valid_date and within range
+    mask_date = (df_filtered["has_valid_date"]) & (df_filtered["date_bucket"] >= start_date) & (df_filtered["date_bucket"] <= end_date)
+    df_filtered = df_filtered[mask_date]
+else:
+    # single date selected case
+    sel = pd.to_datetime(date_range).tz_localize(None)
+    mask_date = (df_filtered["has_valid_date"]) & (df_filtered["date_bucket"].dt.date == sel.date())
+    df_filtered = df_filtered[mask_date]
 
+# apply content filter if enabled
 if show_content_only:
     df_filtered = df_filtered[df_filtered["is_content_page"]]
 
+# counts for diagnostics
 filtered_rows = len(df_filtered)
-excluded = total_rows - filtered_rows
+excluded_by_date = df_raw[~((df_raw["has_valid_date"]) & (df_raw["date_bucket"] >= (start_date if start_date is not None else min_date)) & (df_raw["date_bucket"] <= (end_date if end_date is not None else max_date)))].shape[0] if start_date is not None else 0
+# Better breakdown:
+excluded_date_count = df_raw.shape[0] - df_raw[(df_raw["has_valid_date"]) & (df_raw["date_bucket"] >= start_date) & (df_raw["date_bucket"] <= end_date)].shape[0] if start_date is not None else 0
+excluded_by_content = df_raw.shape[0] - df_raw[df_raw["is_content_page"]].shape[0] if show_content_only else 0
 
-# ----------------------------------------------------------
-# LOAD SUMMARY
-# ----------------------------------------------------------
-msg = f"Loaded {total_rows:,} rows. After filters: {filtered_rows:,} (Excluded: {excluded:,}). "
-msg += "Content filter applied." if show_content_only else "All pages included."
-st.info(msg)
+# -----------------------
+# Show transparent summary (All vs Filtered)
+# -----------------------
+st.subheader("Totals & Filtered Metrics (transparent)")
 
-# ----------------------------------------------------------
-# METRICS
-# ----------------------------------------------------------
-total_hits = len(df_raw)
-unique_bots = df_raw["bot_normalized"].nunique()
-visible_hits = df_filtered[df_filtered["is_visible"]].shape[0]
-ai_hits = df_filtered[df_filtered["is_ai_bot"]].shape[0]
-content_hits = df_filtered[df_filtered["is_content_page"]].shape[0]
+col1, col2, col3, col4, col5 = st.columns(5)
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Total Hits (All Data)", f"{total_hits:,}")
-c2.metric("Unique Bots", unique_bots)
-c3.metric("Visible Hits (200/304)", f"{visible_hits:,}")
-c4.metric("AI-driven Hits", f"{ai_hits:,}")
-c5.metric("Content-page Hits", f"{content_hits:,}")
+# Totals derived from raw file (never filtered)
+col1.metric("Total Hits (All Data, unfiltered)", f"{total_rows:,}")
+col2.metric("Unique Bots (All Data)", df_raw["bot_normalized"].nunique())
+col3.metric("Visible Hits (All Data, 200/304)", f"{df_raw[df_raw['is_visible']].shape[0]:,}")
+col4.metric("AI-driven Hits (All Data)", f"{df_raw[df_raw['is_ai_bot']].shape[0]:,}")
+col5.metric("Content-page Hits (All Data)", f"{df_raw[df_raw['is_content_page']].shape[0]:,}")
 
 st.markdown("---")
 
-# ----------------------------------------------------------
-# VISUALIZATIONS
-# ----------------------------------------------------------
-trend = df_filtered.groupby(["date_bucket", "bot_normalized"]).size().reset_index(name="hits")
-ai_trend = df_filtered.groupby(["date_bucket", "is_ai_bot"]).size().reset_index(name="hits")
-ai_trend["bot_type"] = np.where(ai_trend["is_ai_bot"], "AI Bots", "Traditional")
+# Filtered metrics (based on sidebar)
+st.subheader("Filtered Metrics (used for charts / diagnostics)")
 
-trend = downsample(trend)
-ai_trend = downsample(ai_trend)
+fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
+fcol1.metric("Filtered Hits (in selected date range / content filter)", f"{filtered_rows:,}")
+fcol2.metric("Unique Bots (Filtered)", df_filtered["bot_normalized"].nunique() if filtered_rows>0 else 0)
+fcol3.metric("Visible Hits (Filtered, 200/304)", f"{df_filtered[df_filtered['is_visible']].shape[0]:,}" if filtered_rows>0 else "0")
+fcol4.metric("AI-driven Hits (Filtered)", f"{df_filtered[df_filtered['is_ai_bot']].shape[0]:,}" if filtered_rows>0 else "0")
+fcol5.metric("Content-page Hits (Filtered)", f"{df_filtered[df_filtered['is_content_page']].shape[0]:,}" if filtered_rows>0 else "0")
 
-# --- Crawl Trend
-st.subheader("Crawl Trend by Bot Type")
-fig_trend = px.line(
-    trend,
-    x="date_bucket",
-    y="hits",
-    color="bot_normalized",
-    color_discrete_map=BOT_COLOR_MAP,
+# diagnostics block: how many rows excluded and why
+st.info(
+    f"Excluded rows summary: total excluded = {total_rows - filtered_rows:,} "
+    f"(rows without parseable timestamps or outside date range: {excluded_date_count if start_date is not None else 0:,}; "
+    f"excluded by content filter (if enabled): {excluded_by_content:,})."
 )
-st.plotly_chart(style_plot(fig_trend, "Daily Crawl Volume by Bot"), use_container_width=True)
 
-# --- AI vs Traditional
-st.subheader("AI vs Traditional Crawlers")
-fig_ai = px.area(
-    ai_trend,
-    x="date_bucket",
-    y="hits",
-    color="bot_type",
-    color_discrete_map={"AI Bots": "#a970ff", "Traditional": "#00c3a0"},
-)
-st.plotly_chart(style_plot(fig_ai, "AI vs Traditional Crawl Volume"), use_container_width=True)
+# show small sample of excluded rows for user debugging
+if total_rows - filtered_rows > 0:
+    st.subheader("Sample of rows excluded from filtered dataset (first 10)")
+    # produce excluded set = rows in raw but not in filtered (match by index)
+    excluded_idx = df_raw.index.difference(df_filtered.index)
+    st.dataframe(df_raw.loc[excluded_idx].head(10))
 
-# --- Top Crawlers
-st.subheader("Top Crawlers by Hit Volume")
-bot_summary = (
-    df_filtered.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
-)
-fig_bot = px.bar(
-    bot_summary.head(15),
-    x="hits",
-    y="bot_normalized",
-    orientation="h",
-    color="bot_normalized",
-    color_discrete_map=BOT_COLOR_MAP,
-)
-fig_bot.update_layout(yaxis=dict(autorange="reversed"))
-st.plotly_chart(style_plot(fig_bot, "Top 15 Crawlers"), use_container_width=True)
-
-# --- Top AI URLs
-st.subheader("Top AI-Crawled URLs")
-ai_urls = (
-    df_filtered[df_filtered["is_ai_bot"]]
-    .groupby("url")
-    .size()
-    .reset_index(name="hits")
-    .sort_values("hits", ascending=False)
-)
-fig_urls = px.bar(ai_urls.head(25), x="hits", y="url", orientation="h", color_discrete_sequence=["#a970ff"])
-fig_urls.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=200))
-st.plotly_chart(style_plot(fig_urls, "Top 25 AI-Crawled URLs"), use_container_width=True)
-
-# --- Status Distribution
-st.subheader("Status Code Distribution per Bot")
-status_summary = (
-    df_filtered.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
-)
-status_summary["percent"] = (
-    status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
-)
-fig_status = px.bar(
-    status_summary,
-    x="bot_normalized",
-    y="percent",
-    color="status",
-    color_discrete_sequence=px.colors.qualitative.Safe,
-)
-fig_status.update_layout(barmode="stack", xaxis_tickangle=-45)
-st.plotly_chart(style_plot(fig_status, "Status Code Share per Bot"), use_container_width=True)
-
-# ----------------------------------------------------------
-# INTERPRETATION
-# ----------------------------------------------------------
+# -----------------------
+# Charts (use df_filtered)
+# -----------------------
 st.markdown("---")
-st.subheader("Interpretation Guide")
-st.markdown("""
-**Coverage Ratio** = (AI-crawled pages ÷ total known pages) × 100  
-**Visibility Ratio** = (Visible hits ÷ AI hits) × 100  
+st.subheader("Crawl Trend by Bot Type (Filtered)")
 
-- Focus on **200/304** for true visibility.  
-- Multiple bot types indicate layered discovery and possible AI training ingestion.  
-- **Total Hits** always shows the entire file’s entries; filters affect only charts and other metrics.
-""")
+if filtered_rows == 0:
+    st.warning("No rows in filtered dataset. Adjust Date Range or uncheck content filter.")
+else:
+    trend = df_filtered.groupby(["date_bucket", "bot_normalized"]).size().reset_index(name="hits")
+    trend = downsample(trend, max_points=1000)
+    fig_trend = px.line(trend, x="date_bucket", y="hits", color="bot_normalized",
+                        color_discrete_sequence=px.colors.qualitative.Dark2,
+                        markers=False)
+    fig_trend.update_layout(template="plotly_dark", height=420)
+    fig_trend.update_xaxes(title="date")
+    fig_trend.update_yaxes(title="hits")
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+    st.subheader("AI vs Traditional (Filtered)")
+    ai_trend = df_filtered.groupby(["date_bucket", "is_ai_bot"]).size().reset_index(name="hits")
+    ai_trend["bot_type"] = np.where(ai_trend["is_ai_bot"], "AI Bots", "Traditional")
+    ai_trend = downsample(ai_trend, max_points=1000)
+    fig_ai = px.area(ai_trend, x="date_bucket", y="hits", color="bot_type", template="plotly_dark")
+    fig_ai.update_layout(height=360)
+    st.plotly_chart(fig_ai, use_container_width=True)
+
+    st.subheader("Top Crawlers by Hit Volume (Filtered)")
+    bot_summary = df_filtered.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
+    fig_bot = px.bar(bot_summary.head(int(top_n_bots)), x="hits", y="bot_normalized", orientation="h",
+                     color="bot_normalized", template="plotly_dark")
+    fig_bot.update_layout(yaxis=dict(autorange="reversed"))
+    st.plotly_chart(fig_bot, use_container_width=True)
+
+    st.subheader("Top AI-Crawled URLs (Filtered)")
+    ai_urls = df_filtered[df_filtered["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sort_values("hits", ascending=False)
+    fig_urls = px.bar(ai_urls.head(25), x="hits", y="url", orientation="h", template="plotly_dark")
+    fig_urls.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=220))
+    st.plotly_chart(fig_urls, use_container_width=True)
+
+    st.subheader("Status Code Distribution per Bot (Filtered)")
+    status_summary = df_filtered.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
+    status_summary["percent"] = status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
+    fig_status = px.bar(status_summary, x="bot_normalized", y="percent", color="status", template="plotly_dark")
+    fig_status.update_layout(barmode="stack", xaxis_tickangle=-45)
+    st.plotly_chart(fig_status, use_container_width=True)
+
+# -----------------------
+# Exports & Debug
+# -----------------------
+st.markdown("---")
+st.subheader("Debug & Export")
+st.write("If you want to inspect excluded rows in full, download them for offline analysis.")
+if total_rows - filtered_rows > 0:
+    excluded_df = df_raw.loc[df_raw.index.difference(df_filtered.index)]
+    csv = excluded_df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download excluded rows (CSV)", csv, "excluded_rows.csv", "text/csv")
+
+st.caption("Notes: 'Total Hits (All Data)' comes from the raw uploaded file and never changes with filters. Charts and filtered metrics respect the sidebar controls and exclude rows without parseable timestamps from the date filtering step.")
