@@ -1,22 +1,16 @@
 # Log_App.py
-# Streamlit Website Log Analyzer — AI Search & Bot Insights
-# Fully patched version — timestamp filtering is now 100% type-safe
+# Streamlit Website Log Analyzer — AI Search & Bot Insights (final version for MyVi data)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from utils import (
-    guess_columns,
-    parse_timestamp_column,
-    classify_user_agent,
-    BOT_SIGNATURES
-)
+from utils import guess_columns, classify_user_agent, BOT_SIGNATURES
 
 st.set_page_config(page_title="Website Log Analyzer", layout="wide", initial_sidebar_state="expanded")
 st.title("Website Log Analyzer — AI Search & Bot Insights")
 
-# Upload
+# Sidebar upload
 st.sidebar.header("Upload & Settings")
 uploaded_file = st.sidebar.file_uploader("Upload CSV log file", type=["csv", "txt"])
 
@@ -34,92 +28,52 @@ if not uploaded_file:
 df = load_csv(uploaded_file)
 st.sidebar.success(f"Loaded {len(df):,} rows × {len(df.columns)} columns")
 
-guessed = guess_columns(df.columns.tolist())
+# --- Timestamp handling for MyVi log format ---
+timestamp_cols = [c for c in df.columns if any(k in c.lower() for k in ["time", "date", "timestamp"])]
+auto_ts = None
+for c in timestamp_cols:
+    if df[c].astype(str).str.contains(r"\d{4}-\d{2}-\d{2}T").any():
+        auto_ts = c
+        break
 
-# Column mapping
 st.sidebar.header("Column Mapping")
-col_ts = st.sidebar.selectbox("Timestamp column", ["(none)"] + df.columns.tolist(),
-                              index=(1 if guessed.get("timestamp") in df.columns else 0))
-col_ua = st.sidebar.selectbox("User-Agent column", ["(none)"] + df.columns.tolist(),
-                              index=(1 if guessed.get("user_agent") in df.columns else 0))
-col_path = st.sidebar.selectbox("Path/URL column", ["(none)"] + df.columns.tolist(),
-                                index=(1 if guessed.get("path") in df.columns else 0))
-col_status = st.sidebar.selectbox("Status column", ["(none)"] + df.columns.tolist(),
-                                  index=(1 if guessed.get("status") in df.columns else 0))
-col_bytes = st.sidebar.selectbox("Bytes/Size column", ["(none)"] + df.columns.tolist(),
-                                 index=(1 if guessed.get("bytes") in df.columns else 0))
-col_rt = st.sidebar.selectbox("Response time (ms) column", ["(none)"] + df.columns.tolist(),
-                              index=(1 if guessed.get("response_time") in df.columns else 0))
+col_ts = st.sidebar.selectbox("Timestamp column", timestamp_cols, index=(timestamp_cols.index(auto_ts) if auto_ts else 0))
+col_ua = st.sidebar.selectbox("User-Agent column", df.columns.tolist(), index=(df.columns.get_loc("User-Agent") if "User-Agent" in df.columns else 0))
+col_path = st.sidebar.selectbox("Path/URL column", df.columns.tolist(), index=(df.columns.get_loc("Path") if "Path" in df.columns else 0))
+col_status = st.sidebar.selectbox("Status column", df.columns.tolist(), index=(df.columns.get_loc("Status") if "Status" in df.columns else 0))
+col_bytes = st.sidebar.selectbox("Bytes/Size column", ["(none)"] + df.columns.tolist(), index=(1 if "Bytes" in df.columns else 0))
+col_rt = st.sidebar.selectbox("Response time (ms) column", ["(none)"] + df.columns.tolist())
 
 working = df.copy()
 
-# --- Robust timestamp parsing ---
-if col_ts != "(none)":
-    working = parse_timestamp_column(working, col_ts)
-else:
-    # try auto-detect
-    for c in working.columns:
-        if any(k in c.lower() for k in ["time", "date", "timestamp"]):
-            working = parse_timestamp_column(working, c)
-            st.sidebar.success(f"Auto-detected timestamp column: {c}")
-            break
-
-# ensure timestamp column exists and is datetime
-if "timestamp" not in working.columns:
-    if col_ts != "(none)":
-        working["timestamp"] = working[col_ts]
-    else:
-        working["timestamp"] = pd.NaT
-
-working["timestamp"] = pd.to_datetime(working["timestamp"], errors="coerce", utc=False)
+# --- Robust timestamp conversion ---
+working["timestamp"] = pd.to_datetime(working[col_ts], errors="coerce", utc=True)
 working = working[working["timestamp"].notna()].copy()
+working["timestamp"] = working["timestamp"].dt.tz_convert(None)
 
-# force datetime64 dtype
-if not pd.api.types.is_datetime64_any_dtype(working["timestamp"]):
-    working["timestamp"] = pd.to_datetime(working["timestamp"], errors="coerce")
-
-# other columns
-working["user_agent"] = working[col_ua].astype(str) if col_ua != "(none)" else ""
-working["path"] = working[col_path].astype(str) if col_path != "(none)" else ""
-working["status"] = working[col_status].astype(str) if col_status != "(none)" else ""
+# Normalize other columns
+working["user_agent"] = working[col_ua].astype(str)
+working["path"] = working[col_path].astype(str)
+working["status"] = working[col_status].astype(str)
 working["bytes"] = pd.to_numeric(working[col_bytes], errors="coerce") if col_bytes != "(none)" else np.nan
 working["response_time"] = pd.to_numeric(working[col_rt], errors="coerce") if col_rt != "(none)" else np.nan
 
-# classify bots
+# Classify bots
 working["agent_class"] = working["user_agent"].apply(classify_user_agent)
 working["is_bot"] = working["agent_class"].apply(lambda x: x != "human")
 
-# Filters
+# Sidebar filters
 st.sidebar.header("Filters")
 
-min_date, max_date = None, None
-if working["timestamp"].notna().any():
-    min_date = working["timestamp"].min()
-    max_date = working["timestamp"].max()
-
-default_range = (
-    (min_date.date(), max_date.date())
-    if min_date is not None and pd.notna(min_date) and max_date is not None and pd.notna(max_date)
-    else None
-)
-
+min_date, max_date = working["timestamp"].min(), working["timestamp"].max()
+default_range = (min_date.date(), max_date.date())
 date_range = st.sidebar.date_input("Date range", value=default_range)
 top_n = st.sidebar.slider("Top N items", 5, 50, 10)
 
-# --- SAFE DATE FILTERING ---
-if (
-    "timestamp" in working.columns
-    and working["timestamp"].notna().any()
-    and isinstance(date_range, tuple)
-    and len(date_range) == 2
-):
-    start = pd.Timestamp(date_range[0])
-    end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-
-    # Guarantee both comparison sides are datetime64[ns]
-    working["timestamp"] = pd.to_datetime(working["timestamp"], errors="coerce")
-    mask = (working["timestamp"] >= np.datetime64(start)) & (working["timestamp"] <= np.datetime64(end))
-    working = working.loc[mask].copy()
+start = pd.Timestamp(date_range[0])
+end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+mask = (working["timestamp"] >= start) & (working["timestamp"] <= end)
+working = working.loc[mask].copy()
 
 # KPIs
 k1, k2, k3, k4 = st.columns(4)
@@ -136,24 +90,16 @@ k4.metric("Avg response (ms)", f"{avg_resp:.0f}" if not np.isnan(avg_resp) else 
 st.markdown("---")
 
 # Time-series
-if working["timestamp"].notna().any():
-    ts = working.copy()
-    ts = ts.set_index("timestamp").sort_index()
-    try:
-        ts = ts.resample("D").agg({"is_bot": "sum", "path": "count"})
-        ts["human_hits"] = ts["path"] - ts["is_bot"]
-        ts = ts.reset_index().melt(
-            id_vars="timestamp",
-            value_vars=["path", "is_bot", "human_hits"],
-            var_name="series",
-            value_name="count",
-        )
-        fig_ts = px.line(ts, x="timestamp", y="count", color="series", title="Daily Hits (Bots vs Humans)")
-        st.plotly_chart(fig_ts, use_container_width=True)
-    except Exception as e:
-        st.warning(f"Unable to resample: {e}")
+if not working.empty:
+    ts = working.set_index("timestamp").sort_index()
+    ts = ts.resample("H").agg({"is_bot": "sum", "path": "count"})
+    ts["human_hits"] = ts["path"] - ts["is_bot"]
+    ts = ts.reset_index().melt(id_vars="timestamp", value_vars=["path", "is_bot", "human_hits"],
+                               var_name="series", value_name="count")
+    fig_ts = px.line(ts, x="timestamp", y="count", color="series", title="Hourly Hits (Bots vs Humans)")
+    st.plotly_chart(fig_ts, use_container_width=True)
 else:
-    st.warning("Timestamp column missing or invalid for resampling.")
+    st.warning("No valid timestamps found in dataset.")
 
 # Status codes
 if "status" in working.columns:
@@ -186,14 +132,13 @@ if working["bytes"].notna().sum() > 0:
     st.plotly_chart(fig_size, use_container_width=True)
 
 # Hourly pattern
-if working["timestamp"].notna().any():
-    st.subheader("Hourly Hit Pattern")
-    hourly = working.copy()
-    hourly["hour"] = hourly["timestamp"].dt.hour
-    hour_counts = hourly.groupby(["hour", "is_bot"]).size().reset_index(name="count")
-    hour_counts["type"] = hour_counts["is_bot"].map({True: "bot", False: "human"})
-    fig_hour = px.line(hour_counts, x="hour", y="count", color="type", markers=True, title="Hits by Hour of Day")
-    st.plotly_chart(fig_hour, use_container_width=True)
+st.subheader("Hourly Hit Pattern")
+hourly = working.copy()
+hourly["hour"] = hourly["timestamp"].dt.hour
+hour_counts = hourly.groupby(["hour", "is_bot"]).size().reset_index(name="count")
+hour_counts["type"] = hour_counts["is_bot"].map({True: "bot", False: "human"})
+fig_hour = px.line(hour_counts, x="hour", y="count", color="type", markers=True, title="Hits by Hour of Day")
+st.plotly_chart(fig_hour, use_container_width=True)
 
 # Explorer
 st.subheader("Data Explorer (first 1000 rows)")
