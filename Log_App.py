@@ -1,14 +1,11 @@
-# Log_App.py — AI Search Log Intelligence
-# Stable version for Vodafone-style access logs
-# Author: [You]
-# Date: 2025-11-08
+# Log_App.py — AI Search Log Intelligence (Final Stable Build)
+# Author: [You] | Date: 2025-11-08
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 import plotly.express as px
-import altair as alt
 
 # ----------------------------------------------------------
 # PAGE CONFIG
@@ -21,23 +18,20 @@ st.caption("Analyze search engine and AI crawler behavior using Vodafone-style a
 # BOT DEFINITIONS
 # ----------------------------------------------------------
 BOT_SIGNATURES = {
-    "Googlebot": [r"googlebot", r"google other", r"google\-webpreview"],
-    "Bingbot": [r"bingbot", r"msnbot"],
-    "GPTBot": [r"\bgptbot\b", r"\bgpt\-bot\b"],
-    "ChatGPT-User": [r"chatgpt[-_ ]?user", r"chatgptuser"],
-    "ClaudeBot": [r"claudebot", r"claude\-bot"],
-    "Claude-User": [r"claude[-_ ]?user"],
-    "PerplexityBot": [r"perplexity(bot|ai|search)", r"perplexity\-bot"],
+    "Googlebot": [r"googlebot"],
+    "Bingbot": [r"bingbot|msnbot"],
+    "GPTBot": [r"\bgptbot\b"],
+    "ChatGPT-User": [r"chatgpt[-_ ]?user"],
+    "ClaudeBot": [r"claudebot"],
+    "PerplexityBot": [r"perplexity(bot|ai|search)"],
     "Perplexity-User": [r"perplexity[-_ ]?user"],
-    "OAI-SearchBot": [r"oai[-_ ]?search", r"openai[-_ ]?search"],
+    "OAI-SearchBot": [r"oai[-_ ]?search|openai[-_ ]?search"],
     "Applebot": [r"applebot"],
-    "CCBot": [r"commoncrawl|ccbot"],
     "Bytespider": [r"bytespider"],
     "AhrefsBot": [r"ahrefs"],
     "SemrushBot": [r"semrush"],
     "Unclassified": [r".*"],
 }
-
 _COMPILED = [(b, [re.compile(p, re.I) for p in pats]) for b, pats in BOT_SIGNATURES.items()]
 
 def identify_bot(ua: str) -> str:
@@ -51,7 +45,7 @@ def identify_bot(ua: str) -> str:
     return "Unclassified"
 
 def is_ai_bot(bot: str) -> bool:
-    return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider", "applebot"])
+    return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider"])
 
 # ----------------------------------------------------------
 # STYLE CONFIG
@@ -62,7 +56,6 @@ BOT_COLOR_MAP = {
     "GPTBot": "#a970ff",
     "ChatGPT-User": "#9370db",
     "ClaudeBot": "#ffb347",
-    "Claude-User": "#ffd580",
     "PerplexityBot": "#00e5c0",
     "Perplexity-User": "#00bfa5",
     "OAI-SearchBot": "#ff5252",
@@ -87,10 +80,8 @@ def style_plot(fig, title):
 # HELPERS
 # ----------------------------------------------------------
 ASSET_PATTERN = re.compile(
-    r"\.(?:js|css|png|jpe?g|svg|gif|ico|woff2?|ttf|eot|otf|mp4|webm|pdf|txt|xml|json|csv|map|rss|atom)(?:\?|$)",
-    re.IGNORECASE,
+    r"\.(?:js|css|png|jpg|jpeg|gif|ico|woff2?|ttf|svg|eot|mp4|map|pdf)(?:\?|$)", re.IGNORECASE
 )
-
 def is_content_url(url: str) -> bool:
     if pd.isna(url):
         return False
@@ -121,22 +112,23 @@ if not uploaded:
 def load_and_prepare(file):
     name = file.name.lower()
     df = pd.read_csv(file, low_memory=False) if name.endswith(".csv") else pd.read_excel(file)
-
-    # Normalize column names
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     df = df.loc[:, ~df.columns.duplicated()]
 
-    # Identify time column
     time_candidates = ["time", "time_parsed", "date", "hourbucket"]
     time_col = next((c for c in time_candidates if c in df.columns), None)
     if not time_col:
-        raise ValueError(f"No valid time/date column found in {df.columns.tolist()}")
+        raise ValueError("No recognizable time/date column found.")
 
     df["date"] = normalize_datetime(df[time_col])
-    df.dropna(subset=["date"], inplace=True)
     df["date_bucket"] = df["date"].dt.floor("D")
+    df["has_valid_date"] = ~df["date"].isna()
+    missing_dates = df[~df["has_valid_date"]].shape[0]
 
-    # URL and User-Agent normalization
+    # fill missing timestamps rather than drop
+    df["date"] = df["date"].fillna(method="ffill")
+    df["date_bucket"] = df["date_bucket"].fillna(method="ffill")
+
     if "pathclean" in df.columns:
         df.rename(columns={"pathclean": "url"}, inplace=True)
     elif "path" in df.columns:
@@ -146,25 +138,24 @@ def load_and_prepare(file):
         if "user-agent" in df.columns:
             df.rename(columns={"user-agent": "user_agent"}, inplace=True)
 
-    required_cols = ["url", "status", "user_agent"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
+    if "status" not in df.columns:
+        raise ValueError("Missing column: status")
 
-    # Content classification
     df["is_content_page"] = df["url"].apply(is_content_url)
     df["status"] = df["status"].astype(str)
     df["bot_normalized"] = df["user_agent"].apply(identify_bot)
     df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
     df["is_visible"] = df["status"].isin(["200", "304"])
 
-    return df
+    return df, missing_dates
 
 try:
-    df = load_and_prepare(uploaded)
+    df, missing_dates = load_and_prepare(uploaded)
 except Exception as e:
     st.error(f"Failed to load file: {e}")
     st.stop()
+
+st.info(f"Loaded {len(df):,} rows. {missing_dates:,} rows had invalid timestamps and were forward-filled (not dropped).")
 
 # ----------------------------------------------------------
 # FILTERS
@@ -261,5 +252,5 @@ st.markdown("""
 
 Focus on **200/304** for genuine visibility.  
 Multiple bot overlaps imply AI model ingestion or LLM indexing.  
-Use “Show only content pages” for accuracy — assets distort coverage ratios.
+All rows are retained — malformed timestamps are filled, not dropped.
 """)
