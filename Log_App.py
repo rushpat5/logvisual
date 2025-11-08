@@ -1,22 +1,22 @@
-# Log_App.py — AI Search Log Intelligence (Final Stable Build)
+# Log_App.py — AI Search Log Intelligence (Final Stable Version)
 # Author: [You] | Date: 2025-11-08
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
 import plotly.express as px
+import re
 
-# ----------------------------------------------------------
+# ==========================================================
 # PAGE CONFIG
-# ----------------------------------------------------------
+# ==========================================================
 st.set_page_config(page_title="AI Search Log Intelligence", layout="wide")
 st.title("AI Search Log Intelligence")
 st.caption("Analyze search engine and AI crawler behavior using Vodafone-style access logs.")
 
-# ----------------------------------------------------------
+# ==========================================================
 # BOT DEFINITIONS
-# ----------------------------------------------------------
+# ==========================================================
 BOT_SIGNATURES = {
     "Googlebot": [r"googlebot"],
     "Bingbot": [r"bingbot|msnbot"],
@@ -27,9 +27,9 @@ BOT_SIGNATURES = {
     "Perplexity-User": [r"perplexity[-_ ]?user"],
     "OAI-SearchBot": [r"oai[-_ ]?search|openai[-_ ]?search"],
     "Applebot": [r"applebot"],
-    "Bytespider": [r"bytespider"],
     "AhrefsBot": [r"ahrefs"],
     "SemrushBot": [r"semrush"],
+    "Bytespider": [r"bytespider"],
     "Unclassified": [r".*"],
 }
 _COMPILED = [(b, [re.compile(p, re.I) for p in pats]) for b, pats in BOT_SIGNATURES.items()]
@@ -47,9 +47,9 @@ def identify_bot(ua: str) -> str:
 def is_ai_bot(bot: str) -> bool:
     return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider"])
 
-# ----------------------------------------------------------
-# STYLE CONFIG
-# ----------------------------------------------------------
+# ==========================================================
+# VISUAL THEME
+# ==========================================================
 BOT_COLOR_MAP = {
     "Googlebot": "#00c853",
     "Bingbot": "#2962ff",
@@ -76,16 +76,20 @@ def style_plot(fig, title):
     fig.update_yaxes(showgrid=True, gridcolor="#2a2d35", zeroline=False)
     return fig
 
-# ----------------------------------------------------------
+# ==========================================================
 # HELPERS
-# ----------------------------------------------------------
+# ==========================================================
 ASSET_PATTERN = re.compile(
-    r"\.(?:js|css|png|jpg|jpeg|gif|ico|woff2?|ttf|svg|eot|mp4|map|pdf)(?:\?|$)", re.IGNORECASE
+    r"\.(?:js|css|png|jpg|jpeg|gif|ico|woff2?|ttf|svg)(?:\?|$)", re.IGNORECASE
 )
 def is_content_url(url: str) -> bool:
     if pd.isna(url):
         return False
     return not bool(ASSET_PATTERN.search(str(url).lower()))
+
+def normalize_datetime(series):
+    s = pd.to_datetime(series, errors="coerce", utc=True)
+    return s.dt.tz_localize(None)
 
 def downsample(df, max_points=1000):
     if len(df) <= max_points:
@@ -93,21 +97,17 @@ def downsample(df, max_points=1000):
     step = int(np.ceil(len(df) / max_points))
     return df.iloc[::step, :]
 
-def normalize_datetime(series):
-    s = pd.to_datetime(series, errors="coerce", utc=True)
-    return s.dt.tz_localize(None)
-
-# ----------------------------------------------------------
+# ==========================================================
 # FILE UPLOAD
-# ----------------------------------------------------------
+# ==========================================================
 uploaded = st.file_uploader("Upload your log file (.csv or .xlsx)", type=["csv", "xlsx", "xls"])
 if not uploaded:
     st.info("Upload a log file to continue.")
     st.stop()
 
-# ----------------------------------------------------------
+# ==========================================================
 # DATA LOADING
-# ----------------------------------------------------------
+# ==========================================================
 @st.cache_data(show_spinner=False)
 def load_and_prepare(file):
     name = file.name.lower()
@@ -122,12 +122,6 @@ def load_and_prepare(file):
 
     df["date"] = normalize_datetime(df[time_col])
     df["date_bucket"] = df["date"].dt.floor("D")
-    df["has_valid_date"] = ~df["date"].isna()
-    missing_dates = df[~df["has_valid_date"]].shape[0]
-
-    # fill missing timestamps rather than drop
-    df["date"] = df["date"].fillna(method="ffill")
-    df["date_bucket"] = df["date_bucket"].fillna(method="ffill")
 
     if "pathclean" in df.columns:
         df.rename(columns={"pathclean": "url"}, inplace=True)
@@ -147,39 +141,51 @@ def load_and_prepare(file):
     df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
     df["is_visible"] = df["status"].isin(["200", "304"])
 
-    return df, missing_dates
+    return df
 
 try:
-    df, missing_dates = load_and_prepare(uploaded)
+    df_raw = load_and_prepare(uploaded)
 except Exception as e:
     st.error(f"Failed to load file: {e}")
     st.stop()
 
-st.info(f"Loaded {len(df):,} rows. {missing_dates:,} rows had invalid timestamps and were forward-filled (not dropped).")
+total_rows = len(df_raw)
 
-# ----------------------------------------------------------
+# ==========================================================
 # FILTERS
-# ----------------------------------------------------------
+# ==========================================================
 st.sidebar.header("Filters")
 
-df["date_bucket"] = normalize_datetime(df["date_bucket"])
-df.dropna(subset=["date_bucket"], inplace=True)
-
+df = df_raw.copy()
 min_date, max_date = df["date_bucket"].min().date(), df["date_bucket"].max().date()
-date_range = st.sidebar.date_input("Date Range", (min_date, max_date), min_value=min_date, max_value=max_date)
+
+date_range = st.sidebar.date_input(
+    "Date Range",
+    (min_date, max_date),
+    min_value=min_date,
+    max_value=max_date
+)
+
+show_content_only = st.sidebar.checkbox("Show only content pages (exclude assets)", value=False)
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start, end = [pd.to_datetime(d).tz_localize(None) for d in date_range]
-    mask = (df["date_bucket"] >= start) & (df["date_bucket"] <= end)
-    df = df[mask]
+    df = df[(df["date_bucket"] >= start) & (df["date_bucket"] <= end)]
 
-show_content_only = st.sidebar.checkbox("Show only content pages (exclude assets)", value=True)
 if show_content_only:
     df = df[df["is_content_page"]]
 
-# ----------------------------------------------------------
-# SUMMARY METRICS
-# ----------------------------------------------------------
+filtered_rows = len(df)
+excluded = total_rows - filtered_rows
+
+st.info(
+    f"Loaded {total_rows:,} rows. After filters: {filtered_rows:,} (Excluded: {excluded:,}). "
+    f"{'Content filter applied.' if show_content_only else 'All pages included.'}"
+)
+
+# ==========================================================
+# METRICS
+# ==========================================================
 total_hits = len(df)
 unique_bots = df["bot_normalized"].nunique()
 visible_hits = df[df["is_visible"]].shape[0]
@@ -195,55 +201,73 @@ c5.metric("Content-page Hits", f"{content_hits:,}")
 
 st.markdown("---")
 
-# ----------------------------------------------------------
-# DATA AGGREGATION
-# ----------------------------------------------------------
+# ==========================================================
+# VISUALS
+# ==========================================================
 trend = df.groupby(["date_bucket", "bot_normalized"]).size().reset_index(name="hits")
 ai_trend = df.groupby(["date_bucket", "is_ai_bot"]).size().reset_index(name="hits")
 ai_trend["bot_type"] = np.where(ai_trend["is_ai_bot"], "AI Bots", "Traditional")
 
-bot_summary = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
-ai_urls = df[df["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sort_values("hits", ascending=False)
-status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
-status_summary["percent"] = status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
+trend = downsample(trend, 1000)
+ai_trend = downsample(ai_trend, 1000)
 
-trend = downsample(trend, max_points=1000)
-ai_trend = downsample(ai_trend, max_points=1000)
-
-# ----------------------------------------------------------
-# VISUALIZATIONS
-# ----------------------------------------------------------
 st.subheader("Crawl Trend by Bot Type")
-fig_trend = px.line(trend, x="date_bucket", y="hits", color="bot_normalized", color_discrete_map=BOT_COLOR_MAP)
-fig_trend.update_traces(line=dict(width=2))
+fig_trend = px.line(
+    trend,
+    x="date_bucket",
+    y="hits",
+    color="bot_normalized",
+    color_discrete_map=BOT_COLOR_MAP
+)
 st.plotly_chart(style_plot(fig_trend, "Daily Crawl Volume by Bot"), use_container_width=True)
 
 st.subheader("AI vs Traditional Crawlers")
-fig_ai = px.area(ai_trend, x="date_bucket", y="hits", color="bot_type",
-                 color_discrete_map={"AI Bots": "#a970ff", "Traditional": "#00c3a0"})
-fig_ai.update_traces(opacity=0.85)
+fig_ai = px.area(
+    ai_trend,
+    x="date_bucket",
+    y="hits",
+    color="bot_type",
+    color_discrete_map={"AI Bots": "#a970ff", "Traditional": "#00c3a0"}
+)
 st.plotly_chart(style_plot(fig_ai, "AI vs Traditional Crawl Volume"), use_container_width=True)
 
+bot_summary = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
 st.subheader("Top Crawlers by Hit Volume")
-fig_bot = px.bar(bot_summary.head(15), x="hits", y="bot_normalized", orientation="h",
-                 color="bot_normalized", color_discrete_map=BOT_COLOR_MAP)
+fig_bot = px.bar(
+    bot_summary.head(15),
+    x="hits",
+    y="bot_normalized",
+    orientation="h",
+    color="bot_normalized",
+    color_discrete_map=BOT_COLOR_MAP
+)
 fig_bot.update_layout(yaxis=dict(autorange="reversed"))
 st.plotly_chart(style_plot(fig_bot, "Top 15 Crawlers"), use_container_width=True)
 
+ai_urls = df[df["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sort_values("hits", ascending=False)
 st.subheader("Top AI-Crawled URLs")
 fig_urls = px.bar(ai_urls.head(25), x="hits", y="url", orientation="h", color_discrete_sequence=["#a970ff"])
-fig_urls.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=200, r=40, t=60, b=60))
+fig_urls.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=200))
 st.plotly_chart(style_plot(fig_urls, "Top 25 AI-Crawled URLs"), use_container_width=True)
 
+status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
+status_summary["percent"] = (
+    status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
+)
 st.subheader("Status Code Distribution per Bot")
-fig_status = px.bar(status_summary, x="bot_normalized", y="percent", color="status",
-                    color_discrete_sequence=px.colors.qualitative.Safe)
+fig_status = px.bar(
+    status_summary,
+    x="bot_normalized",
+    y="percent",
+    color="status",
+    color_discrete_sequence=px.colors.qualitative.Safe
+)
 fig_status.update_layout(barmode="stack", xaxis_tickangle=-45)
 st.plotly_chart(style_plot(fig_status, "Status Code Share per Bot"), use_container_width=True)
 
-# ----------------------------------------------------------
-# INTERPRETATION GUIDE
-# ----------------------------------------------------------
+# ==========================================================
+# INTERPRETATION
+# ==========================================================
 st.markdown("---")
 st.subheader("Interpretation Guide")
 st.markdown("""
@@ -252,5 +276,5 @@ st.markdown("""
 
 Focus on **200/304** for genuine visibility.  
 Multiple bot overlaps imply AI model ingestion or LLM indexing.  
-All rows are retained — malformed timestamps are filled, not dropped.
+Totals now include **all rows by default**, unless filters are applied explicitly.
 """)
