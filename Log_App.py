@@ -1,5 +1,5 @@
-# app.py — AI Search Log Intelligence (High-Performance Edition)
-# Optimized for large log files (up to ~10M rows)
+# app.py — AI Search Log Intelligence (Stable + High-Performance Final)
+# Handles duplicate columns safely and avoids freezes on large datasets.
 
 import streamlit as st
 import pandas as pd
@@ -51,7 +51,7 @@ def is_ai_bot(bot: str) -> bool:
     return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider", "ccbot"])
 
 # ----------------------------------------------------------
-# COLOR MAP & STYLES
+# COLOR MAP
 # ----------------------------------------------------------
 BOT_COLOR_MAP = {
     "Googlebot": "#34a853",
@@ -80,7 +80,7 @@ def style_plot(fig, title):
     return fig
 
 # ----------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPERS
 # ----------------------------------------------------------
 ASSET_PATTERN = re.compile(
     r"\.(?:js|css|png|jpe?g|svg|gif|ico|woff2?|ttf|eot|otf|mp4|webm|pdf|txt|xml|json|csv|map)(?:\?|$)",
@@ -93,37 +93,44 @@ def is_content_url(url: str) -> bool:
     return not bool(ASSET_PATTERN.search(str(url).lower()))
 
 def downsample(df, max_points=500):
-    """Reduce rows for heavy charts."""
     if len(df) <= max_points:
         return df
     step = int(np.ceil(len(df) / max_points))
     return df.iloc[::step, :]
 
 # ----------------------------------------------------------
-# FILE INPUT
+# APP HEADER
 # ----------------------------------------------------------
 st.title("AI Search Log Intelligence")
-st.caption("Optimized crawl analytics with AI vs traditional bot segmentation")
+st.caption("Log-scale crawl analytics optimized for AI visibility discovery.")
 
 uploaded = st.file_uploader("Upload your log file (CSV or Excel)", type=["csv", "xlsx", "xls"])
 if not uploaded:
     st.info("Upload a file to begin.")
     st.stop()
 
+# ----------------------------------------------------------
+# CACHED PROCESSOR
+# ----------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_and_process(file):
     name = file.name.lower()
     df = pd.read_csv(file, low_memory=False) if name.endswith(".csv") else pd.read_excel(file)
+
+    # 1. Normalize column names
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]  # remove duplicates early
 
-    # column normalization
-    if "time_parsed" in df.columns:
-        df.rename(columns={"time_parsed": "date"}, inplace=True)
-    elif "time" in df.columns:
-        df.rename(columns={"time": "date"}, inplace=True)
-    elif "date" not in df.columns:
+    # 2. Handle date/time variants
+    date_cols = [c for c in df.columns if "time" in c or "date" in c]
+    if not date_cols:
         raise ValueError("No valid date/time column found.")
+    # pick the most detailed column (usually time_parsed)
+    date_col = sorted(date_cols, key=lambda x: 0 if "parsed" in x else 1)[0]
+    df = df.rename(columns={date_col: "date"})
+    df = df.drop(columns=[c for c in date_cols if c != date_col], errors="ignore")
 
+    # 3. Other renames
     rename_map = {}
     if "pathclean" in df.columns:
         rename_map["pathclean"] = "url"
@@ -134,17 +141,20 @@ def load_and_process(file):
     elif "useragent" in df.columns:
         rename_map["useragent"] = "user_agent"
     if rename_map:
-        df.rename(columns=rename_map, inplace=True)
+        df = df.rename(columns=rename_map)
 
     required = ["date", "url", "status", "user_agent"]
     for r in required:
         if r not in df.columns:
             raise ValueError(f"Missing column: {r}")
 
+    # 4. Types
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df.dropna(subset=["date"], inplace=True)
     df["date_bucket"] = df["date"].dt.floor("D")
     df["status"] = df["status"].astype(str).str.strip()
+
+    # 5. Enrichment
     df["is_content_page"] = df["url"].apply(is_content_url)
     df["bot_normalized"] = df["user_agent"].apply(identify_bot)
     df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
@@ -161,7 +171,6 @@ except Exception as e:
 # FILTERS
 # ----------------------------------------------------------
 st.sidebar.header("Filters")
-
 min_date, max_date = df["date_bucket"].min().date(), df["date_bucket"].max().date()
 date_range = st.sidebar.date_input("Date Range", (min_date, max_date), min_value=min_date, max_value=max_date)
 
@@ -192,7 +201,7 @@ c5.metric("Content-page Hits", f"{content_hits:,}")
 st.markdown("---")
 
 # ----------------------------------------------------------
-# AGGREGATIONS
+# AGGREGATION (w/ downsampling)
 # ----------------------------------------------------------
 trend = df.groupby(["date_bucket", "bot_normalized"]).size().reset_index(name="hits")
 ai_trend = df.groupby(["date_bucket", "is_ai_bot"]).size().reset_index(name="hits")
@@ -203,12 +212,11 @@ ai_urls = df[df["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sor
 status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
 status_summary["percent"] = status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
 
-# Downsample large aggregations
 trend = downsample(trend, max_points=1000)
 ai_trend = downsample(ai_trend, max_points=1000)
 
 # ----------------------------------------------------------
-# VISUALIZATIONS
+# VISUALS
 # ----------------------------------------------------------
 st.subheader("Crawl Trend by Bot Type")
 if len(trend) > 5000:
@@ -269,5 +277,5 @@ st.markdown("""
 **Visibility Ratio** = (Visible hits ÷ AI hits) × 100  
 
 Focus on 200/304 for true visibility.  
-Layered AI crawlers imply inclusion in LLM discovery pipelines.
+Layered AI crawlers indicate inclusion in LLM discovery and indexing pipelines.
 """)
