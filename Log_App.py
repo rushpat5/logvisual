@@ -1,5 +1,5 @@
 # Log_App.py
-# Streamlit Website Log Analyzer — AI Search & Bot Insights (Resample-safe version)
+# Streamlit Website Log Analyzer — AI Search & Bot Insights (auto-detect timestamp-safe version)
 
 import streamlit as st
 import pandas as pd
@@ -59,13 +59,25 @@ if df is not None:
     # Working DataFrame
     working = df.copy()
 
-    # Parse timestamp
+    # Parse or auto-detect timestamp
+    timestamp_parsed = False
     if col_ts != "(none)":
         working = parse_timestamp_column(working, col_ts)
-    else:
-        st.warning("No timestamp column selected. Time-series charts will be disabled.")
+        if "timestamp" in working.columns and working["timestamp"].notna().any():
+            timestamp_parsed = True
+    if not timestamp_parsed:
+        # Auto-detect timestamp column
+        for c in working.columns:
+            if any(k in c.lower() for k in ["time", "date", "timestamp"]):
+                working = parse_timestamp_column(working, c)
+                if "timestamp" in working.columns and working["timestamp"].notna().any():
+                    st.sidebar.success(f"Auto-detected timestamp column: {c}")
+                    timestamp_parsed = True
+                    break
+    if not timestamp_parsed:
+        st.warning("No valid timestamp column detected. Time-based charts will be disabled.")
 
-    # Normalize columns
+    # Normalize other columns
     working["user_agent"] = working[col_ua].astype(str) if col_ua != "(none)" else ""
     working["path"] = working[col_path].astype(str) if col_path != "(none)" else ""
     working["status"] = working[col_status].astype(str) if col_status != "(none)" else ""
@@ -112,7 +124,7 @@ if df is not None:
 
     st.markdown("---")
 
-    # Time-series (safe)
+    # Time-series chart
     if "timestamp" in working.columns and pd.api.types.is_datetime64_any_dtype(working["timestamp"]) and working["timestamp"].notna().any():
         ts = working.dropna(subset=["timestamp"]).copy()
         if not ts.empty:
@@ -125,7 +137,7 @@ if df is not None:
                 fig_ts = px.line(ts, x="timestamp", y="count", color="series", title="Daily Hits (Bots vs Humans)")
                 st.plotly_chart(fig_ts, use_container_width=True)
             except Exception:
-                st.warning("Unable to resample time-series — check timestamp column.")
+                st.warning("Unable to resample time-series. Check timestamp format.")
         else:
             st.warning("No valid timestamps available for time-series plot.")
     else:
