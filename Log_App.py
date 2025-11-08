@@ -1,5 +1,5 @@
 # Log_App.py
-# Streamlit Website Log Analyzer — AI Search & Bot Insights (robust timestamp fix)
+# Streamlit Website Log Analyzer — AI Search & Bot Insights (final robust timestamp filter)
 
 import streamlit as st
 import pandas as pd
@@ -44,23 +44,23 @@ col_path = st.sidebar.selectbox("Path/URL column", ["(none)"] + df.columns.tolis
                                 index=(1 if guessed.get("path") in df.columns else 0))
 col_status = st.sidebar.selectbox("Status column", ["(none)"] + df.columns.tolist(),
                                   index=(1 if guessed.get("status") in df.columns else 0))
-col_ip = st.sidebar.selectbox("IP column", ["(none)"] + df.columns.tolist(),
-                              index=(1 if guessed.get("ip") in df.columns else 0))
 col_bytes = st.sidebar.selectbox("Bytes/Size column", ["(none)"] + df.columns.tolist(),
                                  index=(1 if guessed.get("bytes") in df.columns else 0))
 col_rt = st.sidebar.selectbox("Response time (ms) column", ["(none)"] + df.columns.tolist(),
                               index=(1 if guessed.get("response_time") in df.columns else 0))
-col_ref = st.sidebar.selectbox("Referrer column", ["(none)"] + df.columns.tolist())
 
-# Working DataFrame
 working = df.copy()
 
-# Parse timestamp
+# --- Robust timestamp parsing and enforcement ---
 timestamp_parsed = False
+
+# 1. Try user-selected column
 if col_ts != "(none)":
     working = parse_timestamp_column(working, col_ts)
     if "timestamp" in working.columns and working["timestamp"].notna().any():
         timestamp_parsed = True
+
+# 2. Try auto-detect if user didn't select correctly
 if not timestamp_parsed:
     for c in working.columns:
         if any(k in c.lower() for k in ["time", "date", "timestamp"]):
@@ -69,10 +69,16 @@ if not timestamp_parsed:
                 st.sidebar.success(f"Auto-detected timestamp column: {c}")
                 timestamp_parsed = True
                 break
-if not timestamp_parsed:
-    st.warning("No valid timestamp column detected. Time-based charts will be disabled.")
 
-# Normalize other columns
+# 3. Force cast to datetime even if still wrong
+if "timestamp" not in working.columns and col_ts != "(none)":
+    working["timestamp"] = working[col_ts]
+working["timestamp"] = pd.to_datetime(working["timestamp"], errors="coerce", utc=False)
+working = working.dropna(subset=["timestamp"])
+if not pd.api.types.is_datetime64_any_dtype(working["timestamp"]):
+    working["timestamp"] = pd.to_datetime(working["timestamp"], errors="coerce", utc=False)
+
+# Other columns
 working["user_agent"] = working[col_ua].astype(str) if col_ua != "(none)" else ""
 working["path"] = working[col_path].astype(str) if col_path != "(none)" else ""
 working["status"] = working[col_status].astype(str) if col_status != "(none)" else ""
@@ -86,10 +92,6 @@ working["is_bot"] = working["agent_class"].apply(lambda x: x != "human")
 # Filters
 st.sidebar.header("Filters")
 
-if "timestamp" in working.columns:
-    # Force convert to datetime to avoid TypeError
-    working["timestamp"] = pd.to_datetime(working["timestamp"], errors="coerce", utc=False)
-
 min_date, max_date = None, None
 if "timestamp" in working.columns and working["timestamp"].notna().any():
     min_date = working["timestamp"].min()
@@ -99,14 +101,17 @@ default_range = (min_date.date(), max_date.date()) if min_date is not None and p
 date_range = st.sidebar.date_input("Date range", value=default_range)
 top_n = st.sidebar.slider("Top N items", 5, 50, 10)
 
-# Safe date filtering
+# --- Safe date filtering ---
 if "timestamp" in working.columns and working["timestamp"].notna().any() and isinstance(date_range, tuple) and len(date_range) == 2:
-    start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-    end = end + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+    start = pd.Timestamp(date_range[0])
+    end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+    # Ensure comparison is between datetimes only
+    valid_mask = working["timestamp"].apply(lambda x: isinstance(x, pd.Timestamp))
+    working = working.loc[valid_mask]
     mask = (working["timestamp"] >= start) & (working["timestamp"] <= end)
     working = working.loc[mask]
 
-# KPI Metrics
+# KPIs
 k1, k2, k3, k4 = st.columns(4)
 total_hits = len(working)
 bot_hits = int(working["is_bot"].sum())
@@ -122,20 +127,16 @@ st.markdown("---")
 
 # Time-series
 if "timestamp" in working.columns and working["timestamp"].notna().any():
-    ts = working.dropna(subset=["timestamp"]).copy()
-    if not ts.empty:
-        ts = ts.set_index("timestamp").sort_index()
-        try:
-            ts = ts.resample("D").agg({"is_bot": "sum", "path": "count"})
-            ts["human_hits"] = ts["path"] - ts["is_bot"]
-            ts = ts.reset_index().melt(id_vars="timestamp", value_vars=["path", "is_bot", "human_hits"],
-                                       var_name="series", value_name="count")
-            fig_ts = px.line(ts, x="timestamp", y="count", color="series", title="Daily Hits (Bots vs Humans)")
-            st.plotly_chart(fig_ts, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Unable to resample time-series: {e}")
-    else:
-        st.warning("No valid timestamps for time-series.")
+    ts = working.dropna(subset=["timestamp"]).copy().set_index("timestamp").sort_index()
+    try:
+        ts = ts.resample("D").agg({"is_bot": "sum", "path": "count"})
+        ts["human_hits"] = ts["path"] - ts["is_bot"]
+        ts = ts.reset_index().melt(id_vars="timestamp", value_vars=["path", "is_bot", "human_hits"],
+                                   var_name="series", value_name="count")
+        fig_ts = px.line(ts, x="timestamp", y="count", color="series", title="Daily Hits (Bots vs Humans)")
+        st.plotly_chart(fig_ts, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Unable to resample: {e}")
 else:
     st.warning("Timestamp column missing or invalid for resampling.")
 
