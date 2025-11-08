@@ -1,342 +1,252 @@
-# app.py
-"""
-Streamlit Website Log Analyzer
-- Splits Traditional Search Bots vs AI/LLM Bots
-- Filter by individual bots and groups
-- List URLs with bot hits, status, first/last seen (normalized time)
-- Visualizations: status, bot traffic, top-25 URLs, hourly heatmap, sections
-- Filter: content-only (exclude static assets) or all URLs
-"""
+# Log_App.py
+# Streamlit Bot & AI Traffic Log Analyzer
+# v3 — unified, standalone version (no utils.py required)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
 
-st.set_page_config(page_title="Log Analyzer — Bot & AI Traffic", layout="wide")
+st.set_page_config(page_title="Bot & AI Log Analyzer", layout="wide")
 
-# ---------- Configure known bot signatures ----------
+# ----------------------------
+# BOT SIGNATURES
+# ----------------------------
 TRADITIONAL_BOTS = [
-    "googlebot", "bingbot", "yandex", "duckduckbot", "baiduspider", "slurp"
+    "googlebot", "bingbot", "yandex", "duckduckbot", "baiduspider", "slurp", "ahrefsbot", "semrushbot"
+]
+AI_BOTS = [
+    "gptbot", "chatgpt-user", "openai", "oai-searchbot", "perplexity", "perplexitybot",
+    "claude", "claudebot", "anthropic", "mistral", "bytespider", "ccbot", "serpapi",
+    "copilot", "gpt-4o", "oai", "diffbot", "pi.ai"
+]
+STATIC_EXTENSIONS = [
+    ".css", ".js", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".map", ".eot"
 ]
 
-AI_BOT_SIGS = [
-    "gptbot", "chatgpt-user", "openai", "oai-searchbot", "perplexitybot", "perplexity",
-    "claudebot", "claude", "gpt-4o", "mistral", "bard", "chatgpt", "bytespider", "ccbot",
-    "serpapi", "bingpreview"
-]
-
-STATIC_EXTENSIONS = [".css", ".js", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".map"]
-
-# ---------- Helpers ----------
-def guess_timestamp_col(columns):
-    # prefer 'Time', 'time', 'timestamp', 'Date', 'Time_parsed'
-    for name in ["Time", "time", "timestamp", "Timestamp", "Time_parsed", "Date", "@timestamp", "date"]:
-        if name in columns:
-            return name
-    # fallback: first column that looks like ISO
-    for c in columns:
-        try:
-            sample = c.lower()
-            if "time" in sample or "date" in sample:
-                return c
-        except Exception:
-            pass
-    return None
-
-def normalize_timestamp_series(series):
-    # robust: accepts ISO with offsets, epoch, etc.
-    # returns timezone-naive UTC-normalized timestamps (datetime64[ns])
+# ----------------------------
+# HELPERS
+# ----------------------------
+def normalize_timestamp(series):
     s = pd.to_datetime(series, errors="coerce", utc=True)
-    # drop timezone, convert to naive (UTC baseline)
-    s = s.dt.tz_convert(None)
-    return s
+    return s.dt.tz_convert(None)
 
-def classify_agent_simple(ua):
+def classify_agent(ua):
     if not isinstance(ua, str) or ua.strip() == "":
         return "unknown"
-    u = ua.lower()
-    for s in TRADITIONAL_BOTS:
-        if s in u:
-            return "traditional:" + s
-    for s in AI_BOT_SIGS:
-        if s in u:
+    ua = ua.lower()
+    for s in AI_BOTS:
+        if s in ua:
             return "ai:" + s
-    # heuristics
-    if any(k in u for k in ["bot", "spider", "crawler", "ccbot", "bytespider"]):
-        return "bot:other"
+    for s in TRADITIONAL_BOTS:
+        if s in ua:
+            return "traditional:" + s
+    if "bot" in ua or "spider" in ua or "crawler" in ua:
+        return "other_bot"
     return "human"
 
-def is_static_path(path):
+def detect_static(path):
     if not isinstance(path, str) or path.strip() == "":
         return False
-    p = path.lower().split("?")[0]
-    return any(p.endswith(ext) for ext in STATIC_EXTENSIONS)
+    path = path.lower().split("?")[0]
+    return any(path.endswith(ext) for ext in STATIC_EXTENSIONS)
 
-# ---------- UI: upload & mapping ----------
-st.sidebar.title("Upload & Mapping")
-uploaded_file = st.sidebar.file_uploader("Upload CSV (server logs / enriched export)", type=["csv", "txt"])
-if uploaded_file is None:
-    st.sidebar.info("Upload your CSV (e.g. detailed_hits.csv). Example columns: Time, User-Agent, Path, Status, Bot Type, PathClean, Section, IsStatic")
-    st.stop()
+# ----------------------------
+# SIDEBAR — UPLOAD
+# ----------------------------
+st.sidebar.header("Upload & Settings")
+uploaded = st.sidebar.file_uploader("Upload CSV log file", type=["csv", "txt"])
 
-# load (fast) - allow large files
 @st.cache_data
-def load_df(file):
-    # try read with pandas, fallback to python engine
+def load_csv(file):
     try:
         return pd.read_csv(file, low_memory=False)
     except Exception:
         return pd.read_csv(file, engine="python", low_memory=False)
 
-df = load_df(uploaded_file)
+if not uploaded:
+    st.info("Upload your CSV file to start analysis.")
+    st.stop()
+
+df = load_csv(uploaded)
 st.sidebar.success(f"Loaded {len(df):,} rows × {len(df.columns)} columns")
 
-# Column mapping UI
+# ----------------------------
+# COLUMN MAPPING
+# ----------------------------
 cols = df.columns.tolist()
-ts_guess = guess_timestamp_col(cols) or cols[0]
+def find_col(*names):
+    for n in names:
+        for c in cols:
+            if n.lower() in c.lower():
+                return c
+    return None
 
-st.sidebar.subheader("Column mapping (choose the correct columns)")
-col_time = st.sidebar.selectbox("Timestamp column", options=["(none)"] + cols, index=(cols.index(ts_guess)+1 if ts_guess in cols else 0))
-col_useragent = st.sidebar.selectbox("User-Agent column", options=["(none)"] + cols, index=(cols.index("User-Agent")+1 if "User-Agent" in cols else 0))
-col_path = st.sidebar.selectbox("Path/URL column", options=["(none)"] + cols, index=(cols.index("Path")+1 if "Path" in cols else 0))
-col_status = st.sidebar.selectbox("Status column", options=["(none)"] + cols, index=(cols.index("Status")+1 if "Status" in cols else 0))
-col_pathclean = st.sidebar.selectbox("PathClean (optional)", options=["(none)"] + cols, index=(cols.index("PathClean")+1 if "PathClean" in cols else 0))
-col_section = st.sidebar.selectbox("Section (optional)", options=["(none)"] + cols, index=(cols.index("Section")+1 if "Section" in cols else 0))
-col_bot_type = st.sidebar.selectbox("Bot Type (optional)", options=["(none)"] + cols, index=(cols.index("Bot Type")+1 if "Bot Type" in cols else 0))
-col_isstatic = st.sidebar.selectbox("IsStatic (optional)", options=["(none)"] + cols, index=(cols.index("IsStatic")+1 if "IsStatic" in cols else 0))
+col_time = st.sidebar.selectbox("Timestamp column", ["(none)"] + cols, index=(cols.index(find_col("time")) + 1 if find_col("time") else 0))
+col_ua = st.sidebar.selectbox("User-Agent column", ["(none)"] + cols, index=(cols.index(find_col("user")) + 1 if find_col("user") else 0))
+col_path = st.sidebar.selectbox("Path/URL column", ["(none)"] + cols, index=(cols.index(find_col("path")) + 1 if find_col("path") else 0))
+col_status = st.sidebar.selectbox("Status column", ["(none)"] + cols, index=(cols.index(find_col("status")) + 1 if find_col("status") else 0))
+col_section = st.sidebar.selectbox("Section column (optional)", ["(none)"] + cols, index=(cols.index(find_col("section")) + 1 if find_col("section") else 0))
+col_static = st.sidebar.selectbox("IsStatic column (optional)", ["(none)"] + cols, index=(cols.index(find_col("static")) + 1 if find_col("static") else 0))
 
-# ---------- Preprocess / normalize ----------
-df_work = df.copy()
+# ----------------------------
+# PREPARE DATA
+# ----------------------------
+df["timestamp"] = normalize_timestamp(df[col_time]) if col_time != "(none)" else pd.NaT
+df = df[df["timestamp"].notna()].copy()
 
-# Timestamp normalization
-if col_time != "(none)":
-    df_work["timestamp"] = normalize_timestamp_series(df_work[col_time])
+df["user_agent"] = df[col_ua].astype(str) if col_ua != "(none)" else ""
+df["path"] = df[col_path].astype(str) if col_path != "(none)" else ""
+df["status"] = df[col_status].astype(str).str.strip() if col_status != "(none)" else "unknown"
+df["section"] = df[col_section] if col_section != "(none)" else ""
+
+if col_static != "(none)":
+    df["is_static"] = df[col_static].astype(str).str.upper().isin(["TRUE", "1", "YES"])
 else:
-    # try common columns automatically
-    for candidate in ["Time", "time", "Time_parsed", "Date", "timestamp", "Timestamp"]:
-        if candidate in df_work.columns:
-            df_work["timestamp"] = normalize_timestamp_series(df_work[candidate])
-            break
-    else:
-        df_work["timestamp"] = pd.NaT
+    df["is_static"] = df["path"].apply(detect_static)
 
-# drop rows with invalid timestamp early (we need timestamps for timing analysis)
-valid_ts_mask = df_work["timestamp"].notna()
-if valid_ts_mask.sum() == 0:
-    st.error("No valid timestamps found. Ensure your timestamp column contains ISO datetimes or epoch values. App needs timestamps for timing & resampling.")
-    st.stop()
-df_work = df_work.loc[valid_ts_mask].copy()
+df["agent_class"] = df["user_agent"].apply(classify_agent)
+df["agent_group"] = df["agent_class"].apply(
+    lambda x: "ai" if x.startswith("ai:") else ("traditional" if x.startswith("traditional:") else ("bot" if "bot" in x else "human"))
+)
+df["is_bot"] = df["agent_group"].isin(["ai", "traditional", "bot"])
 
-# Ensure user agent / path / status columns present
-df_work["user_agent"] = df_work[col_useragent] if col_useragent != "(none)" else df_work.get("User-Agent", "").astype(str)
-df_work["path"] = df_work[col_path] if col_path != "(none)" else df_work.get("Path", "").astype(str)
-df_work["status"] = df_work[col_status] if col_status != "(none)" else df_work.get("Status", "").astype(str)
-df_work["path_clean"] = df_work[col_pathclean] if col_pathclean != "(none)" else df_work["path"]
-df_work["section"] = df_work[col_section] if col_section != "(none)" else df_work.get("Section", "")
-df_work["raw_bot_type"] = df_work[col_bot_type] if col_bot_type != "(none)" else df_work.get("Bot Type", "")
-df_work["is_static_input"] = df_work[col_isstatic] if col_isstatic != "(none)" else df_work.get("IsStatic", "")
+df["date"] = df["timestamp"].dt.date
+df["hour"] = df["timestamp"].dt.hour
 
-# classify agents
-df_work["agent_class"] = df_work["user_agent"].fillna("").astype(str).apply(classify_agent_simple)
-# human vs bot flag
-df_work["is_bot"] = ~df_work["agent_class"].isin(["human", "unknown"])
-# group: 'traditional' vs 'ai' vs 'other'
-def agent_group_from_class(ac):
-    if ac.startswith("traditional:"):
-        return "traditional"
-    if ac.startswith("ai:"):
-        return "ai"
-    if ac.startswith("bot:"):
-        return "other_bot"
-    if ac in ("human", "unknown"):
-        return "human"
-    return "other"
-df_work["agent_group"] = df_work["agent_class"].apply(agent_group_from_class)
+# ----------------------------
+# FILTERS
+# ----------------------------
+st.sidebar.header("Filters")
 
-# if raw bot type column provided, prefer it for classification where present
-df_work["raw_bot_type"] = df_work["raw_bot_type"].fillna("").astype(str)
-mask_raw_bot = df_work["raw_bot_type"].str.strip().ne("")
-df_work.loc[mask_raw_bot, "agent_class"] = "raw:" + df_work.loc[mask_raw_bot, "raw_bot_type"].str.lower()
-df_work.loc[mask_raw_bot, "agent_group"] = df_work.loc[mask_raw_bot, "raw_bot_type"].str.lower().apply(
-    lambda v: "traditional" if any(x in v for x in TRADITIONAL_BOTS) else ("ai" if any(x in v for x in AI_BOT_SIGS) else "other_bot")
+bot_types = sorted(df["agent_group"].unique())
+selected_groups = st.sidebar.multiselect("Bot Type(s)", options=bot_types, default=["ai", "traditional"])
+
+agents = sorted(df["agent_class"].unique())
+selected_agents = st.sidebar.multiselect("Specific Agents (optional)", options=agents, default=[])
+
+all_statuses = sorted(df["status"].unique())
+default_statuses = [s for s in ["200", "304", "404"] if s in all_statuses]
+selected_statuses = st.sidebar.multiselect(
+    "Status Codes",
+    options=all_statuses,
+    default=default_statuses,
+    help="Filter status codes included in analysis."
 )
 
-# is_static resolution: prefer explicit column, else heuristic by extension
-if col_isstatic != "(none)":
-    df_work["is_static"] = df_work["is_static_input"].astype(str).str.upper().isin(["TRUE", "1", "YES"])
-else:
-    df_work["is_static"] = df_work["path_clean"].astype(str).apply(is_static_path)
+content_filter = st.sidebar.radio("URL Scope", ["All URLs", "Content-only (exclude static assets)"], index=1)
 
-# normalized datetime fields for table display
-df_work["date"] = df_work["timestamp"].dt.date
-df_work["time"] = df_work["timestamp"].dt.time
-df_work["hour"] = df_work["timestamp"].dt.floor("H")
+min_date, max_date = df["date"].min(), df["date"].max()
+date_range = st.sidebar.date_input("Date Range", (min_date, max_date))
+start = pd.Timestamp(date_range[0])
+end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1)
 
-# ---------- Sidebar: filters user requested ----------
-st.sidebar.header("Filters & selections")
+top_n = st.sidebar.slider("Top N URLs", 5, 100, 25)
 
-# Bot group filter
-bot_group_choice = st.sidebar.multiselect("Agent group(s)", options=["human", "traditional", "ai", "other_bot"], default=["traditional","ai"], help="Select which groups to include")
-
-# Multi-select of individual bots (extracted from agent_class)
-all_agent_classes = sorted(df_work["agent_class"].dropna().unique().tolist())
-selected_agents = st.sidebar.multiselect("Select individual agents (optional)", options=all_agent_classes, default=[])
-
-# Content-only vs all
-content_mode = st.sidebar.radio("URL scope", options=["All URLs", "Content-only (exclude static assets)"], index=1)
-
-# Status code filter
-all_statuses = sorted(df_work["status"].fillna("unknown").unique().tolist())
-selected_statuses = st.sidebar.multiselect("Status codes", options=all_statuses, default=["200","304","404"], help="Filter status codes included in visualizations / tables (empty => include all)")
-
-# Date range filter (default full span)
-min_date = df_work["timestamp"].min().date()
-max_date = df_work["timestamp"].max().date()
-date_range = st.sidebar.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-
-# Top N URLs
-top_n = st.sidebar.slider("Top N URLs (by bot hits)", 5, 100, 25)
-
-# Apply filters to working dataframe
-df_f = df_work.copy()
-
-# group filter
+# Apply filters
+df_f = df.copy()
 if selected_agents:
     df_f = df_f[df_f["agent_class"].isin(selected_agents)]
 else:
-    df_f = df_f[df_f["agent_group"].isin(bot_group_choice)]
+    df_f = df_f[df_f["agent_group"].isin(selected_groups)]
 
-# date filter
-start_dt = pd.Timestamp(date_range[0])
-end_dt = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-df_f = df_f[(df_f["timestamp"] >= start_dt) & (df_f["timestamp"] <= end_dt)]
+if selected_statuses:
+    df_f = df_f[df_f["status"].isin(selected_statuses)]
 
-# content-only filter
-if content_mode == "Content-only (exclude static assets)":
+if content_filter == "Content-only (exclude static assets)":
     df_f = df_f[~df_f["is_static"]]
 
-# status filter
-if selected_statuses:
-    df_f = df_f[df_f["status"].astype(str).isin(selected_statuses)]
+df_f = df_f[(df_f["timestamp"] >= start) & (df_f["timestamp"] < end)]
 
-# ---------- Metrics & KPIs ----------
-st.title("Bot & Traffic Summary")
-c1, c2, c3, c4 = st.columns([1,1,1,1])
+# ----------------------------
+# KPIs
+# ----------------------------
+st.title("Bot & AI Traffic Dashboard")
+c1, c2, c3, c4 = st.columns(4)
 total_hits = len(df_f)
 bot_hits = df_f["is_bot"].sum()
-pages_crawled = df_f["path_clean"].nunique()
-unique_bots = df_f["agent_class"].nunique()
+ai_hits = len(df_f[df_f["agent_group"] == "ai"])
+pages = df_f["path"].nunique()
 
-c1.metric("Filtered hits", f"{total_hits:,}")
-c2.metric("Bot hits", f"{int(bot_hits):,}", f"{(bot_hits/total_hits*100):.1f}%" if total_hits else "0%")
-c3.metric("Pages crawled", f"{pages_crawled:,}")
-c4.metric("Unique bot types", unique_bots)
+c1.metric("Total Hits", f"{total_hits:,}")
+c2.metric("Bot Hits", f"{bot_hits:,}", f"{bot_hits/total_hits*100:.1f}%" if total_hits else "0%")
+c3.metric("AI Bot Hits", f"{ai_hits:,}")
+c4.metric("Unique URLs", f"{pages:,}")
 
 st.markdown("---")
 
-# ---------- Visual: Bot traffic over time ----------
-st.subheader("Bot traffic over time")
-if df_f.empty:
-    st.warning("No rows after filters. Adjust filters.")
-else:
-    # aggregated by hour with breakdown by group
-    timeseries = df_f.groupby([pd.Grouper(key="timestamp", freq="H"), "agent_group"]).size().reset_index(name="count")
-    timeseries["agent_group"] = timeseries["agent_group"].astype(str)
-    fig_ts = px.area(timeseries, x="timestamp", y="count", color="agent_group", title="Hourly traffic by agent group", labels={"count":"hits"})
-    st.plotly_chart(fig_ts, use_container_width=True)
+# ----------------------------
+# VISUALS
+# ----------------------------
 
-# ---------- Visual: Status code distribution ----------
-st.subheader("Status code distribution (filtered)")
+# Traffic Over Time
 if not df_f.empty:
-    status_df = df_f.groupby("status").size().reset_index(name="count").sort_values("count", ascending=False)
-    fig_status = px.bar(status_df, x="status", y="count", title="Status codes", labels={"count":"hits"})
-    st.plotly_chart(fig_status, use_container_width=True)
+    st.subheader("Bot Traffic Over Time (Hourly)")
+    ts = df_f.groupby([pd.Grouper(key="timestamp", freq="H"), "agent_group"]).size().reset_index(name="hits")
+    fig = px.area(ts, x="timestamp", y="hits", color="agent_group", title="Hourly Traffic by Bot Type")
+    st.plotly_chart(fig, use_container_width=True)
 
-# ---------- Visual: Top N URLs (by bot hits) ----------
-st.subheader(f"Top {top_n} URLs by hits (filtered)")
-if not df_f.empty:
-    url_counts = df_f.groupby("path_clean").agg(
-        hits=("path_clean","count"),
-        bot_hits=("is_bot","sum"),
-        unique_bots=("agent_class", "nunique"),
-        first_seen=("timestamp","min"),
-        last_seen=("timestamp","max"),
-        common_status=("status", lambda x: x.mode().iloc[0] if not x.mode().empty else "")
-    ).reset_index().sort_values("hits", ascending=False).head(top_n)
-    # convert datetimes to strings for display
-    url_counts["first_seen"] = url_counts["first_seen"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    url_counts["last_seen"] = url_counts["last_seen"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    st.dataframe(url_counts, use_container_width=True)
-    fig_top = px.bar(url_counts, x="hits", y="path_clean", orientation="h", title=f"Top {top_n} URLs (hits)", height=600)
-    st.plotly_chart(fig_top, use_container_width=True)
+# Status Codes
+st.subheader("HTTP Status Codes")
+status_df = df_f.groupby(["status", "agent_group"]).size().reset_index(name="count")
+fig = px.bar(status_df, x="status", y="count", color="agent_group", barmode="group", title="Status Codes by Bot Type")
+st.plotly_chart(fig, use_container_width=True)
 
-# ---------- Detailed URL list (with events) ----------
-st.subheader("Detailed events — URL, bot/agent, status, timestamp")
-if not df_f.empty:
-    # present most relevant columns
-    display_cols = ["timestamp", "path_clean", "path", "status", "agent_class", "agent_group", "is_bot", "section", "is_static"]
-    present_cols = [c for c in display_cols if c in df_f.columns]
-    # format timestamp
-    df_events = df_f.copy()
-    df_events["timestamp"] = df_events["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    st.dataframe(df_events[present_cols].sort_values(["path_clean","timestamp"], ascending=[True,True]).reset_index(drop=True), use_container_width=True)
-    st.download_button("Export filtered events CSV", df_events[present_cols].to_csv(index=False).encode("utf-8"), file_name="filtered_events.csv")
+# Top URLs
+st.subheader(f"Top {top_n} URLs by Bot Hits")
+url_stats = (
+    df_f.groupby("path")
+    .agg(
+        hits=("path", "count"),
+        first_seen=("timestamp", "min"),
+        last_seen=("timestamp", "max"),
+        common_status=("status", lambda x: x.mode().iloc[0] if not x.mode().empty else ""),
+    )
+    .reset_index()
+    .sort_values("hits", ascending=False)
+    .head(top_n)
+)
+url_stats["first_seen"] = url_stats["first_seen"].dt.strftime("%Y-%m-%d %H:%M")
+url_stats["last_seen"] = url_stats["last_seen"].dt.strftime("%Y-%m-%d %H:%M")
+st.dataframe(url_stats, use_container_width=True)
+fig_urls = px.bar(url_stats, x="hits", y="path", orientation="h", title=f"Top {top_n} URLs")
+st.plotly_chart(fig_urls, use_container_width=True)
 
-# ---------- Crawl behavior: sections ----------
+# Section-wise crawl
 if "section" in df_f.columns and df_f["section"].notna().any():
-    st.subheader("Crawl behavior by Section")
-    sec = df_f.groupby(["section", "agent_group"]).size().reset_index(name="count")
-    fig_sec = px.bar(sec, x="section", y="count", color="agent_group", barmode="group", title="Section-level crawling")
+    st.subheader("Crawl Behavior by Section")
+    sec_df = df_f.groupby(["section", "agent_group"]).size().reset_index(name="count")
+    fig_sec = px.bar(sec_df, x="section", y="count", color="agent_group", barmode="group", title="Section-wise Crawl Distribution")
     st.plotly_chart(fig_sec, use_container_width=True)
-else:
-    st.info("No 'section' data available to show crawl preferences by section.")
 
-# ---------- Crawl depth & timing signals ----------
-st.subheader("Crawl depth & timing signals")
+# Hourly Heatmap
+st.subheader("Crawl Timing Heatmap")
+heat = df_f.groupby(["hour", "agent_group"]).size().reset_index(name="count")
+heat_pivot = heat.pivot(index="hour", columns="agent_group", values="count").fillna(0)
+st.dataframe(heat_pivot)
+fig_heat = px.imshow(
+    heat_pivot.T,
+    labels=dict(x="Hour", y="Agent Group", color="Hits"),
+    title="Hourly Crawl Intensity (Bots & AI)"
+)
+st.plotly_chart(fig_heat, use_container_width=True)
 
-if not df_f.empty:
-    # number of unique paths per agent (per day) as proxy for crawl breadth
-    breadth = df_f.groupby(["agent_class"]).agg(unique_paths=("path_clean","nunique"), total_hits=("path_clean","count")).reset_index().sort_values("total_hits", ascending=False)
-    st.write("Unique paths visited per agent (proxy for crawl breadth):")
-    st.dataframe(breadth.head(50), use_container_width=True)
-
-    # Inter-arrival stats per URL for bots: median time between hits (shows recrawl frequency)
-    bot_events = df_f[df_f["is_bot"]].copy()
-    if not bot_events.empty:
-        bot_events = bot_events.sort_values(["path_clean","timestamp"])
-        bot_events["prev_ts"] = bot_events.groupby("path_clean")["timestamp"].shift(1)
-        bot_events["delta_s"] = (bot_events["timestamp"] - bot_events["prev_ts"]).dt.total_seconds()
-        recrawl = bot_events.groupby("path_clean").agg(
-            bot_hits=("path_clean","count"),
-            median_recrawl_secs=("delta_s", lambda x: np.nanmedian(x.dropna()) if x.dropna().size>0 else np.nan),
-            first_seen=("timestamp","min"),
-            last_seen=("timestamp","max")
-        ).reset_index().sort_values("bot_hits", ascending=False)
-        # humanize secs to hours/days
-        def humanize_secs(s):
-            if pd.isna(s): return None
-            if s < 3600: return f"{int(s)}s"
-            if s < 86400: return f"{s/3600:.1f}h"
-            return f"{s/86400:.1f}d"
-        recrawl["median_recrawl"] = recrawl["median_recrawl_secs"].apply(humanize_secs)
-        st.write("Recrawl frequency (median) for bot-crawled URLs (top 50 by bot hits):")
-        st.dataframe(recrawl.head(50)[["path_clean","bot_hits","median_recrawl"]], use_container_width=True)
-    else:
-        st.info("No bot events in filtered set to compute recrawl frequencies.")
-else:
-    st.warning("No data to compute crawl timing / depth.")
+# Crawl Depth Approximation
+st.subheader("Crawl Depth & Frequency (Proxy)")
+crawl_depth = (
+    df_f.groupby("agent_class")["path"].nunique().reset_index().rename(columns={"path": "unique_urls"})
+)
+st.dataframe(crawl_depth)
 
 st.markdown("---")
 
-# ---------- Extras / recommended next steps ----------
-st.subheader("Suggested KPIs & next steps")
-st.markdown("""
-- Track `Bot hits / Pages crawled` week-over-week to see evolution of AI visibility.
-- Compute `Crawled pages with zero clicks` by merging Server Logs with Search Console exports (clicks/impressions) to find citation opportunities.
-- Watch pages with high recrawl frequency but low click/conversion — potential content to optimize for citations.
-- Consider whitelist/blacklist of user agents for robots.txt / llms.txt handling if required.
-""")
+# ----------------------------
+# EXPORT
+# ----------------------------
+st.subheader("Export Filtered Data")
+df_export = df_f[["timestamp", "path", "status", "user_agent", "agent_class", "agent_group", "is_static"]].copy()
+df_export["timestamp"] = df_export["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+st.download_button("Download Filtered CSV", df_export.to_csv(index=False).encode("utf-8"), "filtered_bot_data.csv")
 
-st.success("Done. Adjust filters to explore specific bots, sections, times, and URL scopes.")
+st.success("Analysis complete.")
