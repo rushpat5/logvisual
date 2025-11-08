@@ -3,7 +3,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 import re
 from datetime import datetime
 
@@ -30,10 +29,10 @@ BOT_SIGNATURES = {
     "Unclassified Bot": [r""],
 }
 
-_COMPILED_PATTERNS = []
-for bot, patterns in BOT_SIGNATURES.items():
-    compiled = [re.compile(p, flags=re.I) for p in patterns]
-    _COMPILED_PATTERNS.append((bot, compiled))
+_COMPILED_PATTERNS = [
+    (bot, [re.compile(p, flags=re.I) for p in patterns])
+    for bot, patterns in BOT_SIGNATURES.items()
+]
 
 def identify_bot(ua: str) -> str:
     if pd.isna(ua):
@@ -146,10 +145,20 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
     start, end = date_range
     df = df[(df["date_only"] >= start) & (df["date_only"] <= end)]
 
+# Bots: include all by default, persist selection
 bots = sorted(df["bot_normalized"].unique())
-bot_filter = st.sidebar.multiselect("Bots to include", bots, default=bots)
-df = df[df["bot_normalized"].isin(bot_filter)]
+if "bot_selection" not in st.session_state:
+    st.session_state.bot_selection = bots
 
+bot_filter = st.sidebar.multiselect(
+    "Bots to include",
+    bots,
+    default=st.session_state.bot_selection,
+)
+st.session_state.bot_selection = bot_filter or bots
+df = df[df["bot_normalized"].isin(st.session_state.bot_selection)]
+
+# Status codes with safe default handling
 statuses = sorted(df["status"].astype(str).unique())
 default_status = [s for s in ["200", "304"] if s in statuses]
 status_filter = st.sidebar.multiselect("Status codes", statuses, default=default_status or statuses)
