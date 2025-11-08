@@ -1,12 +1,12 @@
-# app.py — AI Search Log Intelligence (Dark Edition)
-# Rewritten with accurate content filter, fixed time axis, unified color palette, and improved visuals.
+# app.py — AI Search Log Intelligence (Stable Dark Edition)
+# Final version: fixed dtype comparison, unified visuals, precise content filter.
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import re
-from datetime import datetime
+from datetime import datetime, date
 
 # -------------------------------------------------------------------
 # PAGE SETUP
@@ -79,10 +79,10 @@ def apply_common_style(fig, title):
     return fig
 
 # -------------------------------------------------------------------
-# TITLE + DESCRIPTION
+# HEADER
 # -------------------------------------------------------------------
 st.title("AI Search Log Intelligence")
-st.caption("Log-file–driven crawl analysis with focus on AI discovery and visibility patterns.")
+st.caption("Accurate crawl visibility analytics with AI-bot segmentation and content isolation.")
 
 # -------------------------------------------------------------------
 # FILE UPLOAD
@@ -168,10 +168,12 @@ df["is_visible"] = df["status"].isin(["200", "304"])
 # FILTERS
 # -------------------------------------------------------------------
 st.sidebar.header("Filters")
-min_date, max_date = df["date_only"].min(), df["date_only"].max()
+min_date, max_date = df["date_only"].min().date(), df["date_only"].max().date()
 date_range = st.sidebar.date_input("Date Range", (min_date, max_date), min_value=min_date, max_value=max_date)
+
+# Ensure type consistency for comparison
 if isinstance(date_range, tuple) and len(date_range) == 2:
-    start, end = date_range
+    start, end = [pd.to_datetime(d) for d in date_range]
     df = df[(df["date_only"] >= start) & (df["date_only"] <= end)]
 
 show_content_only = st.sidebar.checkbox("Show only content pages (exclude assets)", value=True)
@@ -199,8 +201,6 @@ st.markdown("---")
 # -------------------------------------------------------------------
 # VISUALS
 # -------------------------------------------------------------------
-
-# Crawl trend by bot type
 st.subheader("Crawl Trend by Bot Type")
 trend = df.groupby(["date_only", "bot_normalized"]).size().reset_index(name="hits")
 fig_trend = px.line(
@@ -208,10 +208,8 @@ fig_trend = px.line(
     color_discrete_map=BOT_COLOR_MAP, markers=True, line_shape="spline"
 )
 fig_trend.update_traces(marker_size=5, line=dict(width=2.5))
-fig_trend = apply_common_style(fig_trend, "Daily Crawl Volume by Bot")
-st.plotly_chart(fig_trend, use_container_width=True)
+st.plotly_chart(apply_common_style(fig_trend, "Daily Crawl Volume by Bot"), use_container_width=True)
 
-# AI vs Traditional
 st.subheader("AI vs Traditional Crawlers")
 ai_trend = df.groupby(["date_only", "is_ai_bot"]).size().reset_index(name="hits")
 ai_trend["bot_type"] = np.where(ai_trend["is_ai_bot"], "AI Bots", "Traditional")
@@ -220,22 +218,17 @@ fig_ai = px.area(
     color_discrete_map={"AI Bots": "#a970ff", "Traditional": "#00c3a0"}
 )
 fig_ai.update_traces(line=dict(width=0), opacity=0.8)
-fig_ai = apply_common_style(fig_ai, "AI vs Traditional Crawl Volume")
-st.plotly_chart(fig_ai, use_container_width=True)
+st.plotly_chart(apply_common_style(fig_ai, "AI vs Traditional Crawl Volume"), use_container_width=True)
 
-# Top Crawlers
 st.subheader("Top Crawlers by Hit Volume")
 bot_summary = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
 fig_bot = px.bar(
     bot_summary.head(15), x="hits", y="bot_normalized", orientation="h",
-    color="bot_normalized", color_discrete_map=BOT_COLOR_MAP,
-    labels={"bot_normalized": "Bot", "hits": "Hits"}
+    color="bot_normalized", color_discrete_map=BOT_COLOR_MAP
 )
 fig_bot.update_layout(yaxis=dict(autorange="reversed"))
-fig_bot = apply_common_style(fig_bot, "Top 15 Crawlers")
-st.plotly_chart(fig_bot, use_container_width=True)
+st.plotly_chart(apply_common_style(fig_bot, "Top 15 Crawlers"), use_container_width=True)
 
-# Top AI-Crawled URLs
 st.subheader("Top AI-Crawled URLs")
 ai_urls = df[df["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sort_values("hits", ascending=False)
 fig_urls = px.bar(
@@ -243,21 +236,17 @@ fig_urls = px.bar(
     color_discrete_sequence=["#a970ff"]
 )
 fig_urls.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=200, r=40, t=60, b=60))
-fig_urls = apply_common_style(fig_urls, "Top 25 AI-Crawled URLs")
-st.plotly_chart(fig_urls, use_container_width=True)
+st.plotly_chart(apply_common_style(fig_urls, "Top 25 AI-Crawled URLs"), use_container_width=True)
 
-# Status Distribution
 st.subheader("Status Code Distribution per Bot")
 status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
 status_summary["percent"] = status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
 fig_status = px.bar(
     status_summary, x="bot_normalized", y="percent", color="status",
-    title="Status Code Share per Bot", labels={"bot_normalized": "Bot", "percent": "Share (%)"},
     color_discrete_sequence=px.colors.qualitative.Safe
 )
 fig_status.update_layout(barmode="stack", xaxis_tickangle=-45)
-fig_status = apply_common_style(fig_status, "Status Code Share per Bot")
-st.plotly_chart(fig_status, use_container_width=True)
+st.plotly_chart(apply_common_style(fig_status, "Status Code Share per Bot"), use_container_width=True)
 
 # -------------------------------------------------------------------
 # INTERPRETATION
