@@ -4,208 +4,209 @@ import plotly.express as px
 import plotly.graph_objects as go
 import re
 
-st.set_page_config(page_title="Bot Traffic Intelligence Dashboard", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="Bot Traffic Intelligence", layout="wide", page_icon="🤖")
 
-# --- BOT SIGNATURES ---
+# -------------------------------
+# Bot Signatures
+# -------------------------------
 BOT_SIGNATURES = {
-    # Search
-    "Googlebot": [r"googlebot", r"googleother", r"mediapartners-google"],
-    "Bingbot": [r"bingbot", r"msnbot", r"adidxbot"],
+    "Googlebot": [r"googlebot", r"googleother"],
+    "Bingbot": [r"bingbot", r"msnbot"],
     "Applebot": [r"applebot"],
-    "YandexBot": [r"yandex(bot|images|video|news)"],
-    "BaiduSpider": [r"baiduspider"],
-    "DuckDuckBot": [r"duckduck(bot|go)"],
-    "YahooBot": [r"slurp"],
-    "Qwantify": [r"qwantify"],
-
-    # AI Crawlers
-    "GPTBot": [r"gptbot", r"openai[-_ ]?(collector|crawler|bot)"],
-    "OAI-SearchBot": [r"oai[-_ ]?searchbot"],
+    "GPTBot": [r"gptbot"],
     "ChatGPT-User": [r"chatgpt[-_ ]?user"],
-    "ClaudeBot": [r"claudebot", r"anthropic"],
-    "Claude-SearchBot": [r"claude[-_ ]?searchbot"],
-    "Claude-User": [r"claude[-_ ]?user"],
+    "ClaudeBot": [r"claudebot"],
     "PerplexityBot": [r"perplexity(bot|ai)"],
     "Perplexity-User": [r"perplexity[-_ ]?user"],
-    "MistralAI-User": [r"mistral(ai|user)"],
-    "CCBot": [r"ccbot"],
-    "Bytespider": [r"bytespider"],
-    "YouBot": [r"you[-_ ]?search[-_ ]?bot"],
-
-    # SEO Tools
+    "MozBot": [r"moz"],
     "AhrefsBot": [r"ahrefs"],
     "SemrushBot": [r"semrush"],
-    "MozBot": [r"moz"],
-    "MajesticBot": [r"mj12bot"],
-    "ScreamingFrog": [r"screamingfrog"],
-    "Sitebulb": [r"sitebulb"],
-    "DeepCrawl": [r"deepcrawl"],
-    "JetOctopus": [r"jetoctopus"],
-
-    # Social
-    "FacebookBot": [r"facebookexternalhit", r"facebot"],
-    "TwitterBot": [r"twitterbot", r"xbot"],
-    "LinkedInBot": [r"linkedinbot"],
-    "PinterestBot": [r"pinterest"],
-    "Slackbot": [r"slackbot"],
-    "DiscordBot": [r"discordbot"],
-
-    # Monitoring
-    "GTMetrix": [r"gtmetrix"],
-    "Pingdom": [r"pingdom"],
-    "UptimeRobot": [r"uptimerobot"],
-    "StatusCake": [r"statuscake"],
-    "CloudflareBot": [r"cloudflare"],
     "CommonCrawl": [r"commoncrawl"],
-    "DotBot": [r"dotbot"]
-}
-
-AI_GROUPS = {
-    "Training": ["GPTBot", "ClaudeBot", "CCBot", "Bytespider"],
-    "Search": ["OAI-SearchBot", "PerplexityBot", "Claude-SearchBot", "YouBot"],
-    "User": ["ChatGPT-User", "Claude-User", "Perplexity-User", "MistralAI-User"]
 }
 
 def identify_bot(ua: str) -> str:
     ua = str(ua).lower()
     for bot, patterns in BOT_SIGNATURES.items():
-        if any(re.search(p, ua) for p in patterns):
-            return bot
+        for p in patterns:
+            if re.search(p, ua):
+                return bot
     return "Unclassified Bot"
 
-def classify_ai_group(bot: str) -> str:
-    for group, bots in AI_GROUPS.items():
-        if bot in bots:
-            return group
-    return "Non-AI"
+# -------------------------------
+# Layout Header
+# -------------------------------
+st.markdown(
+    "<h1 style='text-align:center; color:#FFFFFF;'>🤖 Unified Bot Intelligence Dashboard</h1>",
+    unsafe_allow_html=True,
+)
+st.caption("AI and traditional crawler analytics with executive-level visualization.")
 
-# --- UI HEADER ---
-st.markdown("<h1 style='text-align: center;'>🤖 Unified Bot Traffic Intelligence Dashboard</h1>", unsafe_allow_html=True)
-st.caption("Analyze activity across AI crawlers, search engines, and SEO tools for deeper visibility insights.")
-
-uploaded = st.file_uploader("📂 Upload Excel (with User-Agent, URL, Status, Date columns)", type=["xlsx", "xls"])
+uploaded = st.file_uploader("Upload Excel file", type=["xlsx", "xls"])
 
 if uploaded:
     df = pd.read_excel(uploaded)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    required_cols = {"user-agent", "url", "status", "date"}
-    if not required_cols.issubset(df.columns):
-        st.error(f"Missing columns: {required_cols - set(df.columns)}")
+    # Validate
+    required = {"user-agent", "url", "status", "date"}
+    if not required.issubset(df.columns):
+        st.error(f"Missing required columns: {required - set(df.columns)}")
         st.stop()
 
+    # Enrich
     df["bot_normalized"] = df["user-agent"].apply(identify_bot)
-    df["ai_group"] = df["bot_normalized"].apply(classify_ai_group)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["status"] = df["status"].astype(str)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-    # --- FILTERS ---
-    st.sidebar.header("🔍 Filters")
-    min_date, max_date = df["date"].min(), df["date"].max()
-    date_range = st.sidebar.date_input("Select Date Range", [min_date, max_date])
+    # Sidebar
+    st.sidebar.header("Filters")
+    min_d, max_d = df["date"].min(), df["date"].max()
+    date_range = st.sidebar.date_input("Date Range", [min_d, max_d])
     df = df[(df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= date_range[1])]
 
-    # --- KPIs ---
+    # Metrics
     total_hits = len(df)
     unique_bots = df["bot_normalized"].nunique()
     unique_urls = df["url"].nunique()
-    ai_hits = df[df["ai_group"] != "Non-AI"].shape[0]
-    search_hits = df[df["bot_normalized"].isin(["Googlebot", "Bingbot", "Applebot"])].shape[0]
+    avg_hits_bot = int(df.groupby("bot_normalized").size().mean())
+    ai_hits = df[df["bot_normalized"].str.contains("gpt|claude|perplexity", case=False)].shape[0]
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Bot Hits", f"{total_hits:,}")
+    k1.metric("Total Hits", f"{total_hits:,}")
     k2.metric("Unique Bots", unique_bots)
     k3.metric("Unique URLs", unique_urls)
-    k4.metric("AI Bot Hits", f"{ai_hits:,}")
-    k5.metric("Search Bot Hits", f"{search_hits:,}")
+    k4.metric("Avg Hits/Bot", f"{avg_hits_bot:,}")
+    k5.metric("AI-Driven Hits", f"{ai_hits:,}")
 
     st.markdown("---")
 
-    # --- BOT HIT DISTRIBUTION ---
-    st.subheader("📊 Bot Activity Overview")
-    hits = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
-    fig = px.bar(
-        hits.head(20),
-        x="hits",
+    # -------------------------------
+    # Top Bots
+    # -------------------------------
+    bot_hits = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
+    fig1 = px.bar(
+        bot_hits.head(15),
         y="bot_normalized",
+        x="hits",
         orientation="h",
         color="hits",
-        color_continuous_scale="viridis",
-        title="Top 20 Bots by Total Hits"
+        color_continuous_scale="Plasma",
+        title="Top 15 Bots by Total Hits",
     )
-    fig.update_layout(yaxis_title=None, xaxis_title="Total Hits", height=600)
-    st.plotly_chart(fig, use_container_width=True)
+    fig1.update_layout(
+        height=600,
+        xaxis_title="Hits",
+        yaxis_title=None,
+        plot_bgcolor="#0E1117",
+        paper_bgcolor="#0E1117",
+        font=dict(color="#FFFFFF", size=13),
+    )
+    st.plotly_chart(fig1, use_container_width=True)
 
-    # --- AI GROUP DISTRIBUTION ---
-    st.subheader("🤖 AI Bot Segmentation")
-    ai_summary = df.groupby("ai_group").size().reset_index(name="hits")
-    fig2 = px.pie(
-        ai_summary,
-        names="ai_group",
-        values="hits",
-        title="AI vs Non-AI Bot Traffic Composition",
-        color_discrete_sequence=px.colors.sequential.Plasma
+    # -------------------------------
+    # HTTP Status Visualization (Fixed)
+    # -------------------------------
+    st.markdown("### 🧩 HTTP Status Efficiency (Categorical, % Share)")
+    status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
+    status_summary["percent"] = (
+        status_summary["count"]
+        / status_summary.groupby("bot_normalized")["count"].transform("sum")
+        * 100
+    )
+    status_summary["status"] = status_summary["status"].astype(str)
+    order = ["200", "204", "301", "302", "304", "400", "403", "404", "500"]
+
+    color_map = {
+        "200": "#00C851",
+        "301": "#ffbb33",
+        "302": "#ffbb33",
+        "304": "#33b5e5",
+        "400": "#ff4444",
+        "403": "#ff4444",
+        "404": "#CC0000",
+        "500": "#9933CC",
+    }
+
+    fig2 = go.Figure()
+    for bot in status_summary["bot_normalized"].unique():
+        bot_data = status_summary[status_summary["bot_normalized"] == bot]
+        fig2.add_trace(
+            go.Bar(
+                x=bot_data["status"],
+                y=bot_data["percent"],
+                name=bot,
+                marker_color=[color_map.get(x, "#888") for x in bot_data["status"]],
+                hovertemplate="%{x}: %{y:.1f}%<extra>" + bot + "</extra>",
+            )
+        )
+    fig2.update_layout(
+        barmode="group",
+        xaxis=dict(title="HTTP Status Code", categoryorder="array", categoryarray=order),
+        yaxis=dict(title="Traffic Share (%)"),
+        height=700,
+        plot_bgcolor="#0E1117",
+        paper_bgcolor="#0E1117",
+        font=dict(color="#FFFFFF", size=13),
+        legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h", y=-0.2),
     )
     st.plotly_chart(fig2, use_container_width=True)
 
-    # --- STATUS EFFICIENCY ---
-    st.subheader("📈 HTTP Status Efficiency")
-    status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
-    status_order = ["200", "204", "301", "302", "304", "400", "403", "404", "500"]
-    fig3 = px.bar(
-        status_summary,
-        x="status",
-        y="count",
-        color="bot_normalized",
-        category_orders={"status": status_order},
-        barmode="group",
-        title="HTTP Status Distribution by Bot"
-    )
-    fig3.update_layout(height=700, xaxis_title="HTTP Status Code", yaxis_title="Hit Count")
-    st.plotly_chart(fig3, use_container_width=True)
-
-    # --- TIME TREND ---
-    st.subheader("📅 Bot Crawl Trend Over Time")
-    trend = df.groupby(["date", "ai_group"]).size().reset_index(name="hits")
-    fig4 = px.line(
+    # -------------------------------
+    # Trend Line
+    # -------------------------------
+    st.markdown("### 📈 Crawl Activity Trend")
+    trend = df.groupby(["date", "bot_normalized"]).size().reset_index(name="hits")
+    fig3 = px.line(
         trend,
         x="date",
         y="hits",
-        color="ai_group",
+        color="bot_normalized",
         markers=True,
-        title="Daily Bot Activity (AI vs Non-AI)"
+        title="Daily Crawl Volume by Bot",
+        color_discrete_sequence=px.colors.qualitative.Set3,
     )
-    fig4.update_layout(height=600, xaxis_title="Date", yaxis_title="Hits")
+    fig3.update_layout(
+        height=600,
+        xaxis_title="Date",
+        yaxis_title="Hits",
+        plot_bgcolor="#0E1117",
+        paper_bgcolor="#0E1117",
+        font=dict(color="#FFFFFF"),
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+    # -------------------------------
+    # URL Heatmap
+    # -------------------------------
+    st.markdown("### 🌐 Most Crawled URLs (Heatmap)")
+    top_urls = df.groupby(["bot_normalized", "url"]).size().reset_index(name="hits")
+    top_urls = top_urls.groupby("bot_normalized").apply(lambda x: x.nlargest(5, "hits")).reset_index(drop=True)
+    fig4 = px.treemap(
+        top_urls,
+        path=["bot_normalized", "url"],
+        values="hits",
+        color="hits",
+        color_continuous_scale="Viridis",
+        title="Top 5 URLs per Bot (Treemap View)",
+    )
+    fig4.update_layout(
+        height=900,
+        plot_bgcolor="#0E1117",
+        paper_bgcolor="#0E1117",
+        font=dict(color="#FFFFFF"),
+    )
     st.plotly_chart(fig4, use_container_width=True)
 
-    # --- TOP URLS ---
-    st.subheader("🌐 Most Crawled URLs by Bot")
-    top_urls = df.groupby(["bot_normalized", "url"]).size().reset_index(name="hits").sort_values("hits", ascending=False)
-    top_urls = top_urls.groupby("bot_normalized").head(5)
-    fig5 = px.bar(
-        top_urls,
-        x="hits",
-        y="url",
-        color="bot_normalized",
-        orientation="h",
-        title="Top 5 URLs per Bot"
-    )
-    fig5.update_layout(height=900, yaxis_title=None, xaxis_title="Hits")
-    st.plotly_chart(fig5, use_container_width=True)
-
-    # --- DETAILED BOT VIEW ---
-    st.subheader("🎯 Deep Dive: Individual Bot")
-    selected_bot = st.selectbox("Select Bot", sorted(df["bot_normalized"].unique()))
-    df_bot = df[df["bot_normalized"] == selected_bot]
-    detail = df_bot.groupby(["url", "status"]).size().reset_index(name="hits").sort_values("hits", ascending=False)
-    st.write(f"**{selected_bot}** — {len(df_bot):,} hits across {df_bot['url'].nunique()} unique URLs")
-
-    fig6 = px.treemap(detail, path=["status", "url"], values="hits", title=f"{selected_bot}: URL & Status Breakdown")
-    fig6.update_traces(textinfo="label+value")
-    st.plotly_chart(fig6, use_container_width=True)
-
-    csv = detail.to_csv(index=False).encode("utf-8")
-    st.download_button(f"⬇ Download {selected_bot} Breakdown", csv, f"{selected_bot}_details.csv", "text/csv")
+    # -------------------------------
+    # Deep Dive Table
+    # -------------------------------
+    st.markdown("### 🎯 Detailed Bot View")
+    bot_choice = st.selectbox("Select Bot for Detailed Breakdown", sorted(df["bot_normalized"].unique()))
+    df_bot = df[df["bot_normalized"] == bot_choice]
+    table = df_bot.groupby(["url", "status"]).size().reset_index(name="hits").sort_values("hits", ascending=False)
+    st.dataframe(table, use_container_width=True, height=400)
+    csv = table.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇ Download Breakdown", csv, f"{bot_choice}_report.csv", "text/csv")
 
 else:
-    st.info("Upload your Excel file to start analyzing bot traffic patterns.")
+    st.info("Upload an Excel file to begin.")
