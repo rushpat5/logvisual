@@ -1,21 +1,22 @@
-# app.py — AI Search Log Intelligence (Stable Dark Edition)
-# Final version: fixed dtype comparison, unified visuals, precise content filter.
+# app.py — AI Search Log Intelligence (High-Performance Edition)
+# Optimized for large log files (up to ~10M rows)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import altair as alt
 import re
-from datetime import datetime, date
+from datetime import datetime
 
-# -------------------------------------------------------------------
-# PAGE SETUP
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
+# PAGE CONFIG
+# ----------------------------------------------------------
 st.set_page_config(page_title="AI Search Log Intelligence", layout="wide")
 
-# -------------------------------------------------------------------
-# BOT DEFINITIONS
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
+# BOT SIGNATURES
+# ----------------------------------------------------------
 BOT_SIGNATURES = {
     "Googlebot": [r"googlebot", r"google other", r"google\-webpreview"],
     "Bingbot": [r"bingbot", r"msnbot"],
@@ -49,9 +50,9 @@ def identify_bot(ua: str) -> str:
 def is_ai_bot(bot: str) -> bool:
     return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider", "ccbot"])
 
-# -------------------------------------------------------------------
-# STYLING HELPERS
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
+# COLOR MAP & STYLES
+# ----------------------------------------------------------
 BOT_COLOR_MAP = {
     "Googlebot": "#34a853",
     "Bingbot": "#0084ff",
@@ -65,85 +66,22 @@ BOT_COLOR_MAP = {
     "Unclassified": "#8c8c8c",
 }
 
-def apply_common_style(fig, title):
+def style_plot(fig, title):
     fig.update_layout(
         title=title,
         template="plotly_dark",
         paper_bgcolor="#0f1116",
         plot_bgcolor="#0f1116",
         font=dict(color="#e0e0e0", size=13),
-        margin=dict(t=60, b=60, l=60, r=40),
+        margin=dict(t=50, b=50, l=50, r=40),
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#2a2d35", dtick="D1", tickformat="%b %d")
+    fig.update_xaxes(showgrid=True, gridcolor="#2a2d35", tickformat="%b %d")
     fig.update_yaxes(showgrid=True, gridcolor="#2a2d35", zeroline=False)
     return fig
 
-# -------------------------------------------------------------------
-# HEADER
-# -------------------------------------------------------------------
-st.title("AI Search Log Intelligence")
-st.caption("Accurate crawl visibility analytics with AI-bot segmentation and content isolation.")
-
-# -------------------------------------------------------------------
-# FILE UPLOAD
-# -------------------------------------------------------------------
-uploaded = st.file_uploader("Upload your log file (CSV or Excel)", type=["csv", "xlsx", "xls"])
-if not uploaded:
-    st.info("Upload a file to begin.")
-    st.stop()
-
-def read_input(file):
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file, low_memory=False)
-    return pd.read_excel(file)
-
-df = read_input(uploaded)
-df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-# -------------------------------------------------------------------
-# COLUMN NORMALIZATION
-# -------------------------------------------------------------------
-if "time_parsed" in df.columns:
-    df = df.drop(columns=[c for c in ["time", "date", "hourbucket"] if c in df.columns], errors="ignore")
-    df = df.rename(columns={"time_parsed": "date"})
-elif "time" in df.columns:
-    df = df.drop(columns=[c for c in ["date", "time_parsed", "hourbucket"] if c in df.columns], errors="ignore")
-    df = df.rename(columns={"time": "date"})
-elif "date" not in df.columns:
-    st.error("No valid date/time column found (expected Time_parsed, Time, or Date).")
-    st.stop()
-
-rename_map = {}
-if "pathclean" in df.columns:
-    rename_map["pathclean"] = "url"
-elif "path" in df.columns:
-    rename_map["path"] = "url"
-if "user-agent" in df.columns:
-    rename_map["user-agent"] = "user_agent"
-elif "useragent" in df.columns:
-    rename_map["useragent"] = "user_agent"
-if rename_map:
-    df = df.rename(columns=rename_map)
-
-required = ["date", "url", "status", "user_agent"]
-missing = [c for c in required if c not in df.columns]
-if missing:
-    st.error(f"Missing required columns: {', '.join(missing)}")
-    st.stop()
-
-# -------------------------------------------------------------------
-# CLEANUP
-# -------------------------------------------------------------------
-df = df.loc[:, ~df.columns.duplicated()]
-df["date"] = pd.to_datetime(df["date"], errors="coerce")
-df = df.dropna(subset=["date"])
-df["date_only"] = df["date"].dt.floor("D")
-df["status"] = df["status"].astype(str).str.strip()
-
-# -------------------------------------------------------------------
-# ACCURATE CONTENT FILTER
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
+# HELPER FUNCTIONS
+# ----------------------------------------------------------
 ASSET_PATTERN = re.compile(
     r"\.(?:js|css|png|jpe?g|svg|gif|ico|woff2?|ttf|eot|otf|mp4|webm|pdf|txt|xml|json|csv|map)(?:\?|$)",
     re.IGNORECASE,
@@ -152,37 +90,92 @@ ASSET_PATTERN = re.compile(
 def is_content_url(url: str) -> bool:
     if pd.isna(url):
         return False
-    u = str(url).strip().lower()
-    return not bool(ASSET_PATTERN.search(u))
+    return not bool(ASSET_PATTERN.search(str(url).lower()))
 
-df["is_content_page"] = df["url"].apply(is_content_url)
+def downsample(df, max_points=500):
+    """Reduce rows for heavy charts."""
+    if len(df) <= max_points:
+        return df
+    step = int(np.ceil(len(df) / max_points))
+    return df.iloc[::step, :]
 
-# -------------------------------------------------------------------
-# ENRICHMENT
-# -------------------------------------------------------------------
-df["bot_normalized"] = df["user_agent"].apply(identify_bot)
-df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
-df["is_visible"] = df["status"].isin(["200", "304"])
+# ----------------------------------------------------------
+# FILE INPUT
+# ----------------------------------------------------------
+st.title("AI Search Log Intelligence")
+st.caption("Optimized crawl analytics with AI vs traditional bot segmentation")
 
-# -------------------------------------------------------------------
+uploaded = st.file_uploader("Upload your log file (CSV or Excel)", type=["csv", "xlsx", "xls"])
+if not uploaded:
+    st.info("Upload a file to begin.")
+    st.stop()
+
+@st.cache_data(show_spinner=False)
+def load_and_process(file):
+    name = file.name.lower()
+    df = pd.read_csv(file, low_memory=False) if name.endswith(".csv") else pd.read_excel(file)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    # column normalization
+    if "time_parsed" in df.columns:
+        df.rename(columns={"time_parsed": "date"}, inplace=True)
+    elif "time" in df.columns:
+        df.rename(columns={"time": "date"}, inplace=True)
+    elif "date" not in df.columns:
+        raise ValueError("No valid date/time column found.")
+
+    rename_map = {}
+    if "pathclean" in df.columns:
+        rename_map["pathclean"] = "url"
+    elif "path" in df.columns:
+        rename_map["path"] = "url"
+    if "user-agent" in df.columns:
+        rename_map["user-agent"] = "user_agent"
+    elif "useragent" in df.columns:
+        rename_map["useragent"] = "user_agent"
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+
+    required = ["date", "url", "status", "user_agent"]
+    for r in required:
+        if r not in df.columns:
+            raise ValueError(f"Missing column: {r}")
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df.dropna(subset=["date"], inplace=True)
+    df["date_bucket"] = df["date"].dt.floor("D")
+    df["status"] = df["status"].astype(str).str.strip()
+    df["is_content_page"] = df["url"].apply(is_content_url)
+    df["bot_normalized"] = df["user_agent"].apply(identify_bot)
+    df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
+    df["is_visible"] = df["status"].isin(["200", "304"])
+    return df
+
+try:
+    df = load_and_process(uploaded)
+except Exception as e:
+    st.error(f"Failed to load: {e}")
+    st.stop()
+
+# ----------------------------------------------------------
 # FILTERS
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
 st.sidebar.header("Filters")
-min_date, max_date = df["date_only"].min().date(), df["date_only"].max().date()
+
+min_date, max_date = df["date_bucket"].min().date(), df["date_bucket"].max().date()
 date_range = st.sidebar.date_input("Date Range", (min_date, max_date), min_value=min_date, max_value=max_date)
 
-# Ensure type consistency for comparison
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start, end = [pd.to_datetime(d) for d in date_range]
-    df = df[(df["date_only"] >= start) & (df["date_only"] <= end)]
+    df = df[(df["date_bucket"] >= start) & (df["date_bucket"] <= end)]
 
 show_content_only = st.sidebar.checkbox("Show only content pages (exclude assets)", value=True)
 if show_content_only:
     df = df[df["is_content_page"]]
 
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
 # METRICS
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
 total_hits = len(df)
 unique_bots = df["bot_normalized"].nunique()
 visible_hits = df[df["is_visible"]].shape[0]
@@ -198,59 +191,77 @@ c5.metric("Content-page Hits", f"{content_hits:,}")
 
 st.markdown("---")
 
-# -------------------------------------------------------------------
-# VISUALS
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
+# AGGREGATIONS
+# ----------------------------------------------------------
+trend = df.groupby(["date_bucket", "bot_normalized"]).size().reset_index(name="hits")
+ai_trend = df.groupby(["date_bucket", "is_ai_bot"]).size().reset_index(name="hits")
+ai_trend["bot_type"] = np.where(ai_trend["is_ai_bot"], "AI Bots", "Traditional")
+
+bot_summary = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
+ai_urls = df[df["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sort_values("hits", ascending=False)
+status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
+status_summary["percent"] = status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
+
+# Downsample large aggregations
+trend = downsample(trend, max_points=1000)
+ai_trend = downsample(ai_trend, max_points=1000)
+
+# ----------------------------------------------------------
+# VISUALIZATIONS
+# ----------------------------------------------------------
 st.subheader("Crawl Trend by Bot Type")
-trend = df.groupby(["date_only", "bot_normalized"]).size().reset_index(name="hits")
-fig_trend = px.line(
-    trend, x="date_only", y="hits", color="bot_normalized",
-    color_discrete_map=BOT_COLOR_MAP, markers=True, line_shape="spline"
-)
-fig_trend.update_traces(marker_size=5, line=dict(width=2.5))
-st.plotly_chart(apply_common_style(fig_trend, "Daily Crawl Volume by Bot"), use_container_width=True)
+if len(trend) > 5000:
+    chart = (
+        alt.Chart(trend)
+        .mark_line()
+        .encode(x="date_bucket:T", y="hits:Q", color="bot_normalized:N")
+        .properties(height=400)
+    )
+    st.altair_chart(chart, use_container_width=True)
+else:
+    fig_trend = px.line(
+        trend, x="date_bucket", y="hits", color="bot_normalized",
+        color_discrete_map=BOT_COLOR_MAP
+    )
+    fig_trend.update_traces(line=dict(width=2))
+    st.plotly_chart(style_plot(fig_trend, "Daily Crawl Volume by Bot"), use_container_width=True)
 
 st.subheader("AI vs Traditional Crawlers")
-ai_trend = df.groupby(["date_only", "is_ai_bot"]).size().reset_index(name="hits")
-ai_trend["bot_type"] = np.where(ai_trend["is_ai_bot"], "AI Bots", "Traditional")
 fig_ai = px.area(
-    ai_trend, x="date_only", y="hits", color="bot_type",
+    ai_trend, x="date_bucket", y="hits", color="bot_type",
     color_discrete_map={"AI Bots": "#a970ff", "Traditional": "#00c3a0"}
 )
-fig_ai.update_traces(line=dict(width=0), opacity=0.8)
-st.plotly_chart(apply_common_style(fig_ai, "AI vs Traditional Crawl Volume"), use_container_width=True)
+fig_ai.update_traces(opacity=0.8)
+st.plotly_chart(style_plot(fig_ai, "AI vs Traditional Crawl Volume"), use_container_width=True)
 
 st.subheader("Top Crawlers by Hit Volume")
-bot_summary = df.groupby("bot_normalized").size().reset_index(name="hits").sort_values("hits", ascending=False)
 fig_bot = px.bar(
     bot_summary.head(15), x="hits", y="bot_normalized", orientation="h",
     color="bot_normalized", color_discrete_map=BOT_COLOR_MAP
 )
 fig_bot.update_layout(yaxis=dict(autorange="reversed"))
-st.plotly_chart(apply_common_style(fig_bot, "Top 15 Crawlers"), use_container_width=True)
+st.plotly_chart(style_plot(fig_bot, "Top 15 Crawlers"), use_container_width=True)
 
 st.subheader("Top AI-Crawled URLs")
-ai_urls = df[df["is_ai_bot"]].groupby("url").size().reset_index(name="hits").sort_values("hits", ascending=False)
 fig_urls = px.bar(
     ai_urls.head(25), x="hits", y="url", orientation="h",
     color_discrete_sequence=["#a970ff"]
 )
 fig_urls.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=200, r=40, t=60, b=60))
-st.plotly_chart(apply_common_style(fig_urls, "Top 25 AI-Crawled URLs"), use_container_width=True)
+st.plotly_chart(style_plot(fig_urls, "Top 25 AI-Crawled URLs"), use_container_width=True)
 
 st.subheader("Status Code Distribution per Bot")
-status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
-status_summary["percent"] = status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
 fig_status = px.bar(
     status_summary, x="bot_normalized", y="percent", color="status",
     color_discrete_sequence=px.colors.qualitative.Safe
 )
 fig_status.update_layout(barmode="stack", xaxis_tickangle=-45)
-st.plotly_chart(apply_common_style(fig_status, "Status Code Share per Bot"), use_container_width=True)
+st.plotly_chart(style_plot(fig_status, "Status Code Share per Bot"), use_container_width=True)
 
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
 # INTERPRETATION
-# -------------------------------------------------------------------
+# ----------------------------------------------------------
 st.markdown("---")
 st.subheader("Interpretation Guide")
 st.markdown("""
@@ -258,5 +269,5 @@ st.markdown("""
 **Visibility Ratio** = (Visible hits ÷ AI hits) × 100  
 
 Focus on 200/304 for true visibility.  
-Multiple AI-bot families indicate layered discovery—your pages may be surfacing in LLM training pipelines.
+Layered AI crawlers imply inclusion in LLM discovery pipelines.
 """)
