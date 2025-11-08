@@ -1,5 +1,6 @@
 # Log_App.py
-# Streamlit Website Log Analyzer (AI Search & Bot Insights)
+# Streamlit Website Log Analyzer — AI Search & Bot Insights (Resample-safe version)
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -79,7 +80,7 @@ if df is not None:
     st.sidebar.header("Filters")
 
     min_date, max_date = None, None
-    if "timestamp" in working.columns and working["timestamp"].notna().any():
+    if "timestamp" in working.columns and pd.api.types.is_datetime64_any_dtype(working["timestamp"]) and working["timestamp"].notna().any():
         min_date = working["timestamp"].min()
         max_date = working["timestamp"].max()
 
@@ -91,7 +92,8 @@ if df is not None:
     date_range = st.sidebar.date_input("Date range", value=default_range)
     top_n = st.sidebar.slider("Top N items", 5, 50, 10)
 
-    if "timestamp" in working.columns and isinstance(date_range, tuple) and len(date_range) == 2:
+    # Apply date filter
+    if "timestamp" in working.columns and pd.api.types.is_datetime64_any_dtype(working["timestamp"]) and isinstance(date_range, tuple) and len(date_range) == 2:
         start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
         end = end + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
         working = working[(working["timestamp"] >= start) & (working["timestamp"] <= end)]
@@ -110,15 +112,24 @@ if df is not None:
 
     st.markdown("---")
 
-    # Time-series
-    if "timestamp" in working.columns:
-        ts = working.copy()
-        ts = ts.set_index("timestamp").resample("D").agg({"is_bot": "sum", "path": "count"})
-        ts["human_hits"] = ts["path"] - ts["is_bot"]
-        ts = ts.reset_index().melt(id_vars="timestamp", value_vars=["path", "is_bot", "human_hits"],
-                                   var_name="series", value_name="count")
-        fig_ts = px.line(ts, x="timestamp", y="count", color="series", title="Daily hits (Bots vs Humans)")
-        st.plotly_chart(fig_ts, use_container_width=True)
+    # Time-series (safe)
+    if "timestamp" in working.columns and pd.api.types.is_datetime64_any_dtype(working["timestamp"]) and working["timestamp"].notna().any():
+        ts = working.dropna(subset=["timestamp"]).copy()
+        if not ts.empty:
+            ts = ts.set_index("timestamp")
+            try:
+                ts = ts.resample("D").agg({"is_bot": "sum", "path": "count"})
+                ts["human_hits"] = ts["path"] - ts["is_bot"]
+                ts = ts.reset_index().melt(id_vars="timestamp", value_vars=["path", "is_bot", "human_hits"],
+                                           var_name="series", value_name="count")
+                fig_ts = px.line(ts, x="timestamp", y="count", color="series", title="Daily Hits (Bots vs Humans)")
+                st.plotly_chart(fig_ts, use_container_width=True)
+            except Exception:
+                st.warning("Unable to resample time-series — check timestamp column.")
+        else:
+            st.warning("No valid timestamps available for time-series plot.")
+    else:
+        st.warning("Timestamp column missing or invalid for resampling.")
 
     # Status codes
     if "status" in working.columns:
@@ -151,7 +162,7 @@ if df is not None:
         st.plotly_chart(fig_size, use_container_width=True)
 
     # Hourly pattern
-    if "timestamp" in working.columns:
+    if "timestamp" in working.columns and pd.api.types.is_datetime64_any_dtype(working["timestamp"]) and working["timestamp"].notna().any():
         st.subheader("Hourly Hit Pattern")
         hourly = working.copy()
         hourly["hour"] = hourly["timestamp"].dt.hour
