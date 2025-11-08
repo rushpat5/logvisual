@@ -1,5 +1,5 @@
-# app.py — AI Search Log Intelligence (Stable + High-Performance Final)
-# Handles duplicate columns safely and avoids freezes on large datasets.
+# app.py — AI Search Log Intelligence (Custom Schema Adapted to Vodafone-Style Logs)
+# Works with columns: Time, Time_parsed, Date, HourBucket, PathClean, User-Agent, Status
 
 import streamlit as st
 import pandas as pd
@@ -9,13 +9,10 @@ import altair as alt
 import re
 from datetime import datetime
 
-# ----------------------------------------------------------
-# PAGE CONFIG
-# ----------------------------------------------------------
 st.set_page_config(page_title="AI Search Log Intelligence", layout="wide")
 
 # ----------------------------------------------------------
-# BOT SIGNATURES
+# BOT DEFINITIONS
 # ----------------------------------------------------------
 BOT_SIGNATURES = {
     "Googlebot": [r"googlebot", r"google other", r"google\-webpreview"],
@@ -31,6 +28,7 @@ BOT_SIGNATURES = {
     "Bytespider": [r"bytespider"],
     "AhrefsBot": [r"ahrefs"],
     "SemrushBot": [r"semrush"],
+    "Applebot": [r"applebot"],
     "Other AI": [r"mistral", r"anthropic", r"llm"],
     "Unclassified": [r".*"],
 }
@@ -48,10 +46,10 @@ def identify_bot(ua: str) -> str:
     return "Unclassified"
 
 def is_ai_bot(bot: str) -> bool:
-    return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider", "ccbot"])
+    return any(x in bot.lower() for x in ["gpt", "claude", "perplexity", "oai", "bytespider", "ccbot", "applebot"])
 
 # ----------------------------------------------------------
-# COLOR MAP
+# STYLE
 # ----------------------------------------------------------
 BOT_COLOR_MAP = {
     "Googlebot": "#34a853",
@@ -63,6 +61,7 @@ BOT_COLOR_MAP = {
     "PerplexityBot": "#00c3a0",
     "Perplexity-User": "#00e5c0",
     "OAI-SearchBot": "#ff5252",
+    "Applebot": "#d4af37",
     "Unclassified": "#8c8c8c",
 }
 
@@ -102,7 +101,7 @@ def downsample(df, max_points=500):
 # APP HEADER
 # ----------------------------------------------------------
 st.title("AI Search Log Intelligence")
-st.caption("Log-scale crawl analytics optimized for AI visibility discovery.")
+st.caption("Vodafone-style log schema optimized for bot crawl intelligence analysis.")
 
 uploaded = st.file_uploader("Upload your log file (CSV or Excel)", type=["csv", "xlsx", "xls"])
 if not uploaded:
@@ -110,27 +109,29 @@ if not uploaded:
     st.stop()
 
 # ----------------------------------------------------------
-# CACHED PROCESSOR
+# CACHED DATA LOADER
 # ----------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_and_process(file):
     name = file.name.lower()
     df = pd.read_csv(file, low_memory=False) if name.endswith(".csv") else pd.read_excel(file)
+    df.columns = [c.strip().replace(" ", "_") for c in df.columns]
 
-    # 1. Normalize column names
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    df = df.loc[:, ~df.columns.duplicated()]  # remove duplicates early
+    # Choose best timestamp column
+    time_col = None
+    for candidate in ["time", "time_parsed", "date", "hourbucket"]:
+        if candidate.lower() in df.columns:
+            time_col = candidate
+            break
+    if not time_col:
+        raise ValueError("No recognizable time/date column found (expected: Time, Time_parsed, Date, or HourBucket).")
 
-    # 2. Handle date/time variants
-    date_cols = [c for c in df.columns if "time" in c or "date" in c]
-    if not date_cols:
-        raise ValueError("No valid date/time column found.")
-    # pick the most detailed column (usually time_parsed)
-    date_col = sorted(date_cols, key=lambda x: 0 if "parsed" in x else 1)[0]
-    df = df.rename(columns={date_col: "date"})
-    df = df.drop(columns=[c for c in date_cols if c != date_col], errors="ignore")
+    # Parse date with coercion
+    df["date"] = pd.to_datetime(df[time_col], errors="coerce", dayfirst=True)
+    df.dropna(subset=["date"], inplace=True)
+    df["date_bucket"] = df["date"].dt.floor("D")
 
-    # 3. Other renames
+    # Rename for standardization
     rename_map = {}
     if "pathclean" in df.columns:
         rename_map["pathclean"] = "url"
@@ -138,27 +139,22 @@ def load_and_process(file):
         rename_map["path"] = "url"
     if "user-agent" in df.columns:
         rename_map["user-agent"] = "user_agent"
-    elif "useragent" in df.columns:
+    elif "user_agent" not in df.columns and "useragent" in df.columns:
         rename_map["useragent"] = "user_agent"
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    df.rename(columns=rename_map, inplace=True)
 
+    # Ensure required fields exist
     required = ["date", "url", "status", "user_agent"]
     for r in required:
         if r not in df.columns:
-            raise ValueError(f"Missing column: {r}")
+            raise ValueError(f"Missing required column: {r}")
 
-    # 4. Types
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df.dropna(subset=["date"], inplace=True)
-    df["date_bucket"] = df["date"].dt.floor("D")
     df["status"] = df["status"].astype(str).str.strip()
-
-    # 5. Enrichment
     df["is_content_page"] = df["url"].apply(is_content_url)
     df["bot_normalized"] = df["user_agent"].apply(identify_bot)
     df["is_ai_bot"] = df["bot_normalized"].apply(is_ai_bot)
     df["is_visible"] = df["status"].isin(["200", "304"])
+
     return df
 
 try:
@@ -171,6 +167,7 @@ except Exception as e:
 # FILTERS
 # ----------------------------------------------------------
 st.sidebar.header("Filters")
+
 min_date, max_date = df["date_bucket"].min().date(), df["date_bucket"].max().date()
 date_range = st.sidebar.date_input("Date Range", (min_date, max_date), min_value=min_date, max_value=max_date)
 
@@ -201,7 +198,7 @@ c5.metric("Content-page Hits", f"{content_hits:,}")
 st.markdown("---")
 
 # ----------------------------------------------------------
-# AGGREGATION (w/ downsampling)
+# AGGREGATION
 # ----------------------------------------------------------
 trend = df.groupby(["date_bucket", "bot_normalized"]).size().reset_index(name="hits")
 ai_trend = df.groupby(["date_bucket", "is_ai_bot"]).size().reset_index(name="hits")
@@ -228,42 +225,31 @@ if len(trend) > 5000:
     )
     st.altair_chart(chart, use_container_width=True)
 else:
-    fig_trend = px.line(
-        trend, x="date_bucket", y="hits", color="bot_normalized",
-        color_discrete_map=BOT_COLOR_MAP
-    )
+    fig_trend = px.line(trend, x="date_bucket", y="hits", color="bot_normalized", color_discrete_map=BOT_COLOR_MAP)
     fig_trend.update_traces(line=dict(width=2))
     st.plotly_chart(style_plot(fig_trend, "Daily Crawl Volume by Bot"), use_container_width=True)
 
 st.subheader("AI vs Traditional Crawlers")
-fig_ai = px.area(
-    ai_trend, x="date_bucket", y="hits", color="bot_type",
-    color_discrete_map={"AI Bots": "#a970ff", "Traditional": "#00c3a0"}
-)
+fig_ai = px.area(ai_trend, x="date_bucket", y="hits", color="bot_type",
+                 color_discrete_map={"AI Bots": "#a970ff", "Traditional": "#00c3a0"})
 fig_ai.update_traces(opacity=0.8)
 st.plotly_chart(style_plot(fig_ai, "AI vs Traditional Crawl Volume"), use_container_width=True)
 
 st.subheader("Top Crawlers by Hit Volume")
-fig_bot = px.bar(
-    bot_summary.head(15), x="hits", y="bot_normalized", orientation="h",
-    color="bot_normalized", color_discrete_map=BOT_COLOR_MAP
-)
+fig_bot = px.bar(bot_summary.head(15), x="hits", y="bot_normalized", orientation="h",
+                 color="bot_normalized", color_discrete_map=BOT_COLOR_MAP)
 fig_bot.update_layout(yaxis=dict(autorange="reversed"))
 st.plotly_chart(style_plot(fig_bot, "Top 15 Crawlers"), use_container_width=True)
 
 st.subheader("Top AI-Crawled URLs")
-fig_urls = px.bar(
-    ai_urls.head(25), x="hits", y="url", orientation="h",
-    color_discrete_sequence=["#a970ff"]
-)
+fig_urls = px.bar(ai_urls.head(25), x="hits", y="url", orientation="h",
+                  color_discrete_sequence=["#a970ff"])
 fig_urls.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=200, r=40, t=60, b=60))
 st.plotly_chart(style_plot(fig_urls, "Top 25 AI-Crawled URLs"), use_container_width=True)
 
 st.subheader("Status Code Distribution per Bot")
-fig_status = px.bar(
-    status_summary, x="bot_normalized", y="percent", color="status",
-    color_discrete_sequence=px.colors.qualitative.Safe
-)
+fig_status = px.bar(status_summary, x="bot_normalized", y="percent", color="status",
+                    color_discrete_sequence=px.colors.qualitative.Safe)
 fig_status.update_layout(barmode="stack", xaxis_tickangle=-45)
 st.plotly_chart(style_plot(fig_status, "Status Code Share per Bot"), use_container_width=True)
 
@@ -277,5 +263,5 @@ st.markdown("""
 **Visibility Ratio** = (Visible hits ÷ AI hits) × 100  
 
 Focus on 200/304 for true visibility.  
-Layered AI crawlers indicate inclusion in LLM discovery and indexing pipelines.
+AI and LLM crawler overlaps suggest data entering training ecosystems.
 """)
