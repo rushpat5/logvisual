@@ -150,8 +150,9 @@ bots = sorted(df["bot_normalized"].unique())
 bot_filter = st.sidebar.multiselect("Bots to include", bots, default=bots)
 df = df[df["bot_normalized"].isin(bot_filter)]
 
-statuses = sorted(df["status"].unique())
-status_filter = st.sidebar.multiselect("Status codes", statuses, default=["200", "304"])
+statuses = sorted(df["status"].astype(str).unique())
+default_status = [s for s in ["200", "304"] if s in statuses]
+status_filter = st.sidebar.multiselect("Status codes", statuses, default=default_status or statuses)
 df = df[df["status"].isin(status_filter)]
 
 top_n = st.sidebar.number_input("Top N bots/URLs", min_value=5, max_value=100, value=15)
