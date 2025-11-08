@@ -135,7 +135,7 @@ df["is_visible"] = df["status"].isin(["200", "304"])
 df["date_only"] = df["date"].dt.date
 
 # ------------------------------------
-# Sidebar Filters
+# Sidebar Filters (date and status only)
 # ------------------------------------
 st.sidebar.header("Filters")
 
@@ -145,20 +145,6 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
     start, end = date_range
     df = df[(df["date_only"] >= start) & (df["date_only"] <= end)]
 
-# Bots: include all by default, persist selection
-bots = sorted(df["bot_normalized"].unique())
-if "bot_selection" not in st.session_state:
-    st.session_state.bot_selection = bots
-
-bot_filter = st.sidebar.multiselect(
-    "Bots to include",
-    bots,
-    default=st.session_state.bot_selection,
-)
-st.session_state.bot_selection = bot_filter or bots
-df = df[df["bot_normalized"].isin(st.session_state.bot_selection)]
-
-# Status codes with safe default handling
 statuses = sorted(df["status"].astype(str).unique())
 default_status = [s for s in ["200", "304"] if s in statuses]
 status_filter = st.sidebar.multiselect("Status codes", statuses, default=default_status or statuses)
@@ -220,7 +206,7 @@ st.plotly_chart(fig_trend, use_container_width=True)
 # ------------------------------------
 # Status Distribution
 # ------------------------------------
-st.subheader("HTTP Status Distribution (selected bots)")
+st.subheader("HTTP Status Distribution (All Bots)")
 status_summary = df.groupby(["bot_normalized", "status"]).size().reset_index(name="count")
 status_summary["percent"] = status_summary["count"] / status_summary.groupby("bot_normalized")["count"].transform("sum") * 100
 top_bots = bot_hits.head(top_n)["bot_normalized"].tolist()
@@ -266,9 +252,9 @@ st.markdown("---")
 st.subheader("Actionable Insights")
 st.markdown(
     """
-- Focus on 200 and 304 statuses for visibility.
-- Separate AI bot analysis (GPTBot, ClaudeBot, PerplexityBot) to track AI search exposure.
-- Use per-bot tables to detect redundant crawling or underperforming sections.
-- Monitor daily trend divergence between AI and traditional crawlers.
+- This dashboard reflects *all* bots in your log file.
+- Focus on 200 and 304 statuses for real visibility.
+- AI-driven crawlers (GPTBot, Claude, Perplexity) are highlighted separately in metrics and trends.
+- Use deep-dive tables to pinpoint high-crawl but low-value URLs.
 """
 )
