@@ -2,3 +2,6 @@ streamlit>=1.20
 pandas>=1.5
 plotly>=5.6
 numpy>=1.22
+pyarrow>=6.0.0    # optional (Parquet export)
+pytest>=7.0       # for running unit tests in CI
+flake8>=5.0.0     # linting in CI
