@@ -1,371 +1,615 @@
-# Log_App.py
-# Streamlit Bot & UA Log Analyzer — revised
-# Single-file version that fixes the dt.strftime error, removes the "Column mapping (auto-suggested)" heading,
-# and classifies requests by a single user-agent name token.
+# app.py
+# SEO-focused Log Analyzer (Streamlit)
+# Single-file app:
+# - No left-side column-mapping UI (only uploader)
+# - Curated ~60 user-agent tokens
+# - Implements 19 SEO metrics (enabled)
+# - Auto-detects columns with heuristics
+# - Clean Plotly visuals and data tables
+# Requirements: streamlit, pandas, numpy, plotly, python-dateutil, pyarrow (optional for parquet export)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 import io
 import re
 from datetime import timedelta
 
-st.set_page_config(page_title="Bot & UA Log Analyzer", layout="wide")
+st.set_page_config(page_title="SEO Log Analyzer — Bot & Crawl Insights", layout="wide", initial_sidebar_state="expanded")
+st.title("SEO Log Analyzer — Bot & Crawl Insights")
 
-# ----------------------------
-# CONFIG / SIGNATURES
-# ----------------------------
-BOT_SIGNALS = [
-    "gptbot", "chatgpt-user", "openai", "oai-searchbot", "perplexity", "perplexitybot",
-    "claude", "claudebot", "anthropic", "mistral", "bytespider", "ccbot", "serpapi",
-    "copilot", "gpt-4o", "bingbot", "googlebot", "yandex", "duckduckbot", "baiduspider",
-    "slurp", "ahrefsbot", "semrushbot", "bingpreview", "sogou", "curl", "wget",
-    "python-requests"
+# ---------------------------
+# Curated UA tokens (~60) — Option 2
+# ---------------------------
+UA_TOKENS = [
+    "gptbot","chatgpt-user","oai-searchbot","openai","perplexity","perplexitybot",
+    "claude","claudebot","anthropic","mistral","bytespider","ccbot","serpapi",
+    "copilot","bingbot","googlebot","yandex","duckduckbot","baiduspider","slurp",
+    "ahrefsbot","semrushbot","bingpreview","sogou","applebot","facebookexternalhit",
+    "linkedinbot","duckduckgo","bingpreview","majestic","ia_archiver","facebot",
+    "iesnare","rogerbot","seznambot","rambler","sistrix","mj12bot","dotbot","surge",
+    "screaming frog","screamingfrog","python-requests","curl","wget","httpclient",
+    "phantomjs","headless","scrapy","crawler","spider","bot","robot","sitebot",
+    "bingbot","baiduspider","yeti","yisou","yandexbot","semrushbot","ahrefsbot-proxy",
+    "uptimebot","uptime-kuma"
 ]
-# common browser tokens to extract simple browser name
-BROWSER_TOKENS = ["chrome", "firefox", "safari", "edge", "msie", "trident", "opera", "opr", "mozilla"]
+# ensure uniqueness, lowercase
+UA_TOKENS = sorted({t.lower() for t in UA_TOKENS})
 
-STATIC_DEFAULT_EXTS = [".css", ".js", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".map", ".eot", ".webp"]
+# ---------------------------
+# Helpers: column guessing & parsing
+# ---------------------------
+def guess_columns(columns):
+    """Heuristic mapping for common log exports. Returns dict of guessed names or None."""
+    low = {c.lower(): c for c in columns}
+    def find_any(keywords):
+        for kw in keywords:
+            for c in columns:
+                if kw in c.lower():
+                    return c
+        return None
+    out = {}
+    out["timestamp"] = find_any(["time_parsed","time","timestamp","date","datetime","ts","time_parsed"])
+    out["path"] = find_any(["pathclean","path","uri","request","url"])
+    out["raw_path"] = find_any(["path","uri","request","url"])
+    out["status"] = find_any(["status","statuscode","response","statusclass","status_code"])
+    out["client_ip"] = find_any(["clientip","ip","remote_addr","remote"])
+    out["user_agent"] = find_any(["user-agent","user_agent","useragent","ua","agent"])
+    out["bytes"] = find_any(["bytes","size","response_size","content_length"])
+    out["referer"] = find_any(["referer","referrer","refer"])
+    out["query_params"] = find_any(["queryparams","query","qs","query_string","params"])
+    out["section"] = find_any(["section","site_section","area"])
+    out["session"] = find_any(["sessionid","session","sid"])
+    out["response_time"] = find_any(["response_time","latency","time_taken","request_time"])
+    return out
 
-# ----------------------------
-# HELPERS
-# ----------------------------
-def normalize_timestamp(series):
-    """Return tz-naive UTC datetimes (or NaT) for a pandas Series."""
-    s = pd.to_datetime(series, errors="coerce", utc=True)
-    # drop tzinfo to make grouping easier (hour etc.)
+def robust_read(file):
+    """Attempt to read CSV/TSV robustly."""
+    raw = file.getvalue()
+    text_sample = raw.decode("utf-8", errors="replace").splitlines()
+    first = text_sample[0] if text_sample else ""
+    delim = "\t" if "\t" in first else ","
     try:
-        return s.dt.tz_convert(None)
+        df = pd.read_csv(io.BytesIO(raw), sep=delim, engine="c", low_memory=False)
     except Exception:
-        # if series contains NaT or cannot tz-convert, just return as-is but ensure dtype
-        return pd.to_datetime(s, errors="coerce").dt.tz_localize(None) if s.dtype == object else s
-
-def detect_static(path, extra_exts=None, regex=None):
-    if not isinstance(path, str) or path.strip() == "":
-        return False
-    p = path.split("?", 1)[0].lower()
-    exts = list(STATIC_DEFAULT_EXTS)
-    if extra_exts:
-        exts += [e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower() for e in extra_exts.split(",") if e.strip()]
-    for ext in exts:
-        if p.endswith(ext):
-            return True
-    if regex:
         try:
-            if re.search(regex, p):
-                return True
+            df = pd.read_csv(io.BytesIO(raw), sep=delim, engine="python", on_bad_lines="skip", low_memory=False)
         except Exception:
-            pass
-    return False
+            # fallback to one-column load
+            df = pd.read_fwf(io.BytesIO(raw))
+    return df
 
+def parse_timestamp_column(df, col):
+    """Robust timestamp parsing: epoch ms/s, ISO, common formats. Produces tz-naive UTC."""
+    s = df[col]
+    # attempt numeric epoch
+    try:
+        num = pd.to_numeric(s, errors="coerce")
+    except Exception:
+        num = pd.Series([np.nan]*len(s))
+    df["_ts_tmp"] = pd.NaT
+    if num.notna().any():
+        if (num > 1e12).any():
+            df["_ts_tmp"] = pd.to_datetime(num, unit="ms", errors="coerce", utc=True)
+        elif (num > 1e9).any():
+            df["_ts_tmp"] = pd.to_datetime(num, unit="s", errors="coerce", utc=True)
+    # parse strings for remaining
+    rem = df["_ts_tmp"].isna()
+    if rem.any():
+        try:
+            parsed = pd.to_datetime(s[rem], errors="coerce", utc=True, infer_datetime_format=True)
+        except Exception:
+            parsed = pd.to_datetime(s[rem], errors="coerce", utc=True)
+        df.loc[rem, "_ts_tmp"] = parsed
+    # final fallback parse common formats
+    if df["_ts_tmp"].isna().all():
+        for fmt in ("%d/%b/%Y:%H:%M:%S %z", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M"):
+            try:
+                df["_ts_tmp"] = pd.to_datetime(s, format=fmt, errors="coerce", utc=True)
+                if df["_ts_tmp"].notna().any():
+                    break
+            except Exception:
+                pass
+    # convert to tz-naive (UTC)
+    df["timestamp"] = df["_ts_tmp"].dt.tz_convert(None)
+    df.drop(columns=["_ts_tmp"], inplace=True, errors="ignore")
+    return df
+
+# ---------------------------
+# UA token extraction
+# ---------------------------
+BROWSER_TOKENS = ["chrome","firefox","safari","edge","msie","trident","opera","opr","mozilla"]
 def extract_agent_token(ua):
-    """
-    Return a single canonical token for the UA string:
-    - first match from BOT_SIGNALS (exact substring)
-    - else first browser token match (chrome, firefox, safari, edge, etc.)
-    - else 'unknown' or 'other' depending on content
-    """
-    if not isinstance(ua, str) or ua.strip() == "":
+    if not isinstance(ua, str) or ua.strip()=="":
         return "unknown"
     s = ua.lower()
-    # prefer exact signal match
-    for token in BOT_SIGNALS:
-        if token in s:
-            return token
-    # browsers: find first browser token
+    # check curated tokens first
+    for t in UA_TOKENS:
+        if t in s:
+            return t
+    # browser heuristics
     for b in BROWSER_TOKENS:
         if b in s:
-            # normalize some tokens: 'opr' -> opera, 'msie'/'trident' -> ie
-            if b in ("opr", "opera"):
-                return "opera"
-            if b in ("msie", "trident"):
+            if b in ("msie","trident"):
                 return "ie"
-            if b == "mozilla" and "firefox" not in s and "chrome" not in s:
-                # generic 'mozilla' without firefox/chrome is ambiguous; treat as 'mozilla'
-                return "mozilla"
+            if b=="opr":
+                return "opera"
             return b
-    # additional heuristics: if contains "bot" anywhere return 'bot' (generic)
-    if "bot" in s or "spider" in s or "crawler" in s or "scraper" in s:
+    # generic bot heuristics
+    if re.search(r"(bot|spider|crawler|scraper|wget|curl|python-requests|headless|phantomjs)", s):
         return "bot"
-    # else attempt short token from first token before slash or space
-    first_token = s.split()[0].split("/")[0]
-    if len(first_token) <= 30 and re.match(r"^[a-z0-9\-\_\.]+$", first_token):
-        return first_token
+    # fallback: first token before / or space
+    tok = s.split()[0].split("/")[0]
+    if len(tok)>0 and len(tok)<40:
+        return tok
     return "other"
 
-def safe_format_datetime(series, fmt="%Y-%m-%d %H:%M"):
-    """Format datetimes in a Series safely; return strings (empty for NaT)."""
-    # Ensure datetime dtype
-    sdt = pd.to_datetime(series, errors="coerce")
-    # if dtype is datetime64, use dt.strftime; else fallback apply
-    if hasattr(sdt.dt, "strftime"):
-        return sdt.dt.strftime(fmt).fillna("")
-    else:
-        return sdt.apply(lambda x: x.strftime(fmt) if pd.notna(x) else "")
+# ---------------------------
+# Analysis functions (SEO-focused)
+# ---------------------------
+def canonicalize_path(raw_path):
+    """Return path without domain; keep path+query optional. Handles typical 'https://domain/path?qs' inputs."""
+    if not isinstance(raw_path, str):
+        return ""
+    p = raw_path.strip()
+    # remove scheme+domain
+    if p.startswith("http://") or p.startswith("https://"):
+        # remove protocol and domain
+        try:
+            p = re.sub(r"^https?://[^/]+", "", p)
+        except Exception:
+            pass
+    # ensure begins with /
+    if p=="":
+        return "/"
+    return p
 
-# ----------------------------
-# SIDEBAR — UPLOAD & SETTINGS
-# ----------------------------
-st.sidebar.header("Upload & Settings")
-uploaded = st.sidebar.file_uploader("Upload CSV log file", type=["csv", "txt", "tsv"])
+def split_path_and_query(path):
+    if not isinstance(path, str):
+        return (path or "", "")
+    if "?" in path:
+        a,b = path.split("?",1)
+        return (a, b)
+    return (path, "")
+
+def count_query_params(qs):
+    if not qs:
+        return 0
+    # parse key=value pairs heuristically
+    pairs = [p for p in re.split("[&;]", qs) if p.strip()!=""]
+    return len(pairs)
+
+# sessionize by client_ip + agent_token (30m inactivity)
+def sessionize(df, ip_col="client_ip", agent_col="agent_token", timeout_minutes=30):
+    # require timestamp sorted
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    session_ids = []
+    last = {}
+    sid_counter = 0
+    for idx, row in df.iterrows():
+        key = (row.get(ip_col,""), row.get(agent_col,""))
+        ts = row["timestamp"]
+        if pd.isna(ts):
+            sid = f"nosess-{idx}"
+            session_ids.append(sid)
+            continue
+        if key not in last:
+            sid_counter += 1
+            sid = f"s{sid_counter}"
+            last[key] = (ts, sid)
+            session_ids.append(sid)
+            continue
+        last_ts, last_sid = last[key]
+        diff = (ts - last_ts).total_seconds()/60.0
+        if diff > timeout_minutes:
+            sid_counter += 1
+            sid = f"s{sid_counter}"
+            last[key] = (ts, sid)
+            session_ids.append(sid)
+        else:
+            # continue same session
+            last[key] = (ts, last_sid)
+            session_ids.append(last_sid)
+    return session_ids
+
+# ---------------------------
+# UI: uploader only (no mapping fields)
+# ---------------------------
+st.sidebar.info("Upload server log CSV/TSV. App will auto-detect columns. No column mapping UI shown per settings.")
+uploaded = st.sidebar.file_uploader("Upload CSV/TSV", type=["csv","tsv","txt"], help="Upload CSV or TSV exported from your logs. Auto-detection used.")
+sitemap_file = st.sidebar.file_uploader("Optional: sitemap.xml (plain text)", type=["xml","txt"], help="Optional sitemap to compare coverage", key="sitemap")
 
 if not uploaded:
-    st.info("Upload your CSV/TSV file to start analysis.")
+    st.info("Upload a CSV/TSV to begin analysis.")
     st.stop()
 
-@st.cache_data
-def load_csv(file):
-    """Try multiple engines and delimiters to robustly load logs."""
-    # read bytes
-    raw = file.getvalue()
-    # try to detect delimiter by first line
-    try:
-        sample = raw.decode("utf-8", errors="replace").splitlines()[0]
-    except Exception:
-        sample = ""
-    delim = "\t" if "\t" in sample else ","
-    try:
-        return pd.read_csv(io.BytesIO(raw), sep=delim, low_memory=False)
-    except Exception:
-        # fallback: try python engine and allow bad lines
-        try:
-            return pd.read_csv(io.BytesIO(raw), sep=delim, engine="python", on_bad_lines="skip", low_memory=False)
-        except Exception:
-            # last resort: read as single-column and attempt to parse
-            return pd.read_fwf(io.BytesIO(raw))
+df = robust_read(uploaded)
 
-df = load_csv(uploaded)
-st.sidebar.success(f"Loaded {len(df):,} rows × {len(df.columns)} columns")
+# ---------------------------
+# Auto-detect columns and prepare
+# ---------------------------
+guesses = guess_columns(df.columns.tolist())
+# if timestamp not found, try any likely candidate
+if not guesses.get("timestamp"):
+    # fallback: common header variations
+    for candidate in ["Time_parsed","Time","time_parsed","time","timestamp","Date"]:
+        if candidate in df.columns:
+            guesses["timestamp"] = candidate
+            break
 
-# Minimal column remapping UI (placed under same Upload & Settings area)
-cols = df.columns.tolist()
-def find_col(*names):
-    for n in names:
-        for c in cols:
-            if n.lower() in c.lower():
-                return c
-    return None
-
-col_time = st.sidebar.selectbox("Timestamp column", ["(none)"] + cols, index=(cols.index(find_col("time")) + 1 if find_col("time") else 0))
-col_ua = st.sidebar.selectbox("User-Agent column", ["(none)"] + cols, index=(cols.index(find_col("user")) + 1 if find_col("user") else 0))
-col_path = st.sidebar.selectbox("Path/URL column", ["(none)"] + cols, index=(cols.index(find_col("path", "uri", "url")) + 1 if find_col("path", "uri", "url") else 0))
-col_status = st.sidebar.selectbox("Status column", ["(none)"] + cols, index=(cols.index(find_col("status", "code")) + 1 if find_col("status", "code") else 0))
-col_ip = st.sidebar.selectbox("Client IP column (optional)", ["(none)"] + cols, index=(cols.index(find_col("ip", "client")) + 1 if find_col("ip", "client") else 0))
-col_static = st.sidebar.selectbox("IsStatic column (optional)", ["(none)"] + cols, index=(cols.index(find_col("static")) + 1 if find_col("static") else 0))
-
-# Static detection settings
-st.sidebar.markdown("Static asset detection:")
-extra_exts = st.sidebar.text_input("Extra extensions (comma-separated)", value="")
-static_regex = st.sidebar.text_input("Static regex (optional)", value="")
-
-# Preview
-st.subheader("Preview (first 8 rows)")
-st.dataframe(df.head(8))
-
-# ----------------------------
-# PREPARE DATA
-# ----------------------------
-# Parse timestamp if available
-if col_time != "(none)":
-    # Attempt robust parse including epochs
-    s = df[col_time]
-    # attempt numeric epoch detection
-    try:
-        numeric = pd.to_numeric(s, errors="coerce")
-    except Exception:
-        numeric = pd.Series([np.nan] * len(s))
-    df["timestamp"] = pd.NaT
-    if numeric.notna().any():
-        # heuristics
-        if (numeric > 1e12).any():
-            df["timestamp"] = pd.to_datetime(numeric, unit="ms", errors="coerce", utc=True)
-        elif (numeric > 1e9).any():
-            df["timestamp"] = pd.to_datetime(numeric, unit="s", errors="coerce", utc=True)
-        # if many NaT remain, try parsing original strings
-        if df["timestamp"].isna().mean() > 0.5:
-            df["timestamp"] = pd.to_datetime(s, errors="coerce", utc=True, infer_datetime_format=True)
-    else:
-        df["timestamp"] = pd.to_datetime(s, errors="coerce", utc=True, infer_datetime_format=True)
+# require timestamp presence to enable time-based metrics; still conduct others when missing
+if guesses.get("timestamp"):
+    df = parse_timestamp_column(df, guesses["timestamp"])
 else:
     df["timestamp"] = pd.NaT
 
-# normalize timestamps
-df["timestamp"] = normalize_timestamp(df["timestamp"])
-
-# other fields
-df["user_agent"] = df[col_ua].astype(str) if col_ua != "(none)" else ""
-df["path"] = df[col_path].astype(str) if col_path != "(none)" else ""
-df["status"] = df[col_status].astype(str).str.strip() if col_status != "(none)" else "unknown"
-df["client_ip"] = df[col_ip].astype(str) if col_ip != "(none)" else ""
-if col_static != "(none)":
-    df["is_static"] = df[col_static].astype(str).str.upper().isin(["TRUE", "1", "YES"])
+# canonicalize path column: prefer PathClean, Path, raw path columns
+path_col = guesses.get("path") or guesses.get("raw_path")
+if path_col:
+    df["_raw_path"] = df[path_col].astype(str)
 else:
-    df["is_static"] = df["path"].apply(lambda p: detect_static(p, extra_exts, static_regex))
+    # try a column named 'Path' or 'Request'
+    fallback = None
+    for c in df.columns:
+        if re.search(r"path|request|uri|url", c, re.IGNORECASE):
+            fallback = c
+            break
+    df["_raw_path"] = df[fallback].astype(str) if fallback else df.iloc[:,0].astype(str)
 
-# New: simplified agent token extraction (single-name)
-df["agent_token"] = df["user_agent"].apply(extract_agent_token)
-# boolean bot flag (heuristic): token in bot signals or token == "bot"
-df["is_bot"] = df["agent_token"].apply(lambda t: (t in BOT_SIGNALS) or (t == "bot"))
+# split into canonical path and query params
+df["_canon_path"] = df["_raw_path"].apply(lambda p: canonicalize_path(p))
+df["_path_only"], df["_qs"] = zip(*df["_canon_path"].apply(split_path_and_query))
+df["_qs_count"] = df["_qs"].apply(count_query_params)
 
+# status
+status_col = guesses.get("status")
+df["_status"] = df[status_col].astype(str) if status_col and status_col in df.columns else df.get("Status", "").astype(str)
+
+# client ip
+ip_col_guess = guesses.get("client_ip")
+df["_client_ip"] = df[ip_col_guess].astype(str) if ip_col_guess and ip_col_guess in df.columns else df.get("ClientIP", "").astype(str) if "ClientIP" in df.columns else ""
+
+# user-agent
+ua_col = guesses.get("user_agent")
+df["_user_agent"] = df[ua_col].astype(str) if ua_col and ua_col in df.columns else df.get("User-Agent", "").astype(str) if "User-Agent" in df.columns else ""
+
+# bytes / response size
+bytes_col = guesses.get("bytes")
+df["_bytes"] = pd.to_numeric(df[bytes_col], errors="coerce") if bytes_col and bytes_col in df.columns else pd.to_numeric(df.get("Bytes", pd.Series([np.nan]*len(df))), errors="coerce")
+
+# section
+section_col = guesses.get("section")
+df["_section"] = df[section_col].astype(str) if section_col and section_col in df.columns else df.get("Section", "").astype(str) if "Section" in df.columns else ""
+
+# session id if provided
+session_col = guesses.get("session")
+df["_session_id_orig"] = df[session_col].astype(str) if session_col and session_col in df.columns else df.get("SessionID","").astype(str) if "SessionID" in df.columns else ""
+
+# response time if provided
+rt_col = guesses.get("response_time")
+df["_resp_time"] = pd.to_numeric(df[rt_col], errors="coerce") if rt_col and rt_col in df.columns else None
+
+# agent token
+df["_agent_token"] = df["_user_agent"].apply(extract_agent_token)
+
+# is_static heuristic: prefer IsStatic column if present, else compute from extension
+isstatic_col = None
+for c in df.columns:
+    if c.lower() in ("isstatic","is_static","file","is_static_flag"):
+        isstatic_col = c
+        break
+if isstatic_col:
+    df["_is_static"] = df[isstatic_col].astype(str).str.upper().isin(["TRUE","1","YES"])
+else:
+    def detect_static_from_path(p):
+        if not isinstance(p, str) or p.strip()=="":
+            return False
+        p2 = p.split("?")[0].lower()
+        exts = [".css",".js",".svg",".png",".jpg",".jpeg",".gif",".ico",".woff",".woff2",".ttf",".map",".eot",".webp"]
+        return any(p2.endswith(e) for e in exts)
+    df["_is_static"] = df["_path_only"].apply(detect_static_from_path)
+
+# basic derived
 df["date"] = df["timestamp"].dt.date
 df["hour"] = df["timestamp"].dt.hour
 
-# ----------------------------
-# FILTERS
-# ----------------------------
+# create sessionized ids (using client_ip + agent_token)
+df = df.sort_values("timestamp").reset_index(drop=True)
+df["_sessionizer_key"] = list(zip(df["_client_ip"].fillna(""), df["_agent_token"].fillna("")))
+df["_session_id"] = sessionize(df, ip_col="_client_ip", agent_col="_agent_token", timeout_minutes=30)
+# ensure types
+df["_qs_count"] = df["_qs_count"].fillna(0).astype(int)
+df["_bytes"] = pd.to_numeric(df["_bytes"], errors="coerce")
+
+# ---------------------------
+# Optional sitemap parse (extract URLs) for metric 13
+# ---------------------------
+sitemap_urls = set()
+if sitemap_file:
+    try:
+        txt = sitemap_file.getvalue().decode("utf-8", errors="ignore")
+        # rough extract <loc> tags
+        sitemap_urls = set(re.findall(r"<loc>(.*?)</loc>", txt, flags=re.IGNORECASE))
+        sitemap_paths = {canonicalize_path(u).split("?")[0] for u in sitemap_urls}
+    except Exception:
+        sitemap_urls = set()
+        sitemap_paths = set()
+else:
+    sitemap_paths = set()
+
+# ---------------------------
+# Filters (minimal): date range, select agents optional
+# ---------------------------
 st.sidebar.header("Filters")
-agent_tokens = sorted(df["agent_token"].unique())
-selected_agents = st.sidebar.multiselect("Agent token(s)", options=agent_tokens, default=agent_tokens[:6] if len(agent_tokens)>6 else agent_tokens)
-all_statuses = sorted(df["status"].unique())
-default_statuses = [s for s in ["200", "304", "404"] if s in all_statuses]
-selected_statuses = st.sidebar.multiselect("Status Codes", options=all_statuses, default=default_statuses)
-content_filter = st.sidebar.radio("URL Scope", ["All URLs", "Content-only (exclude static assets)"], index=1)
-min_date, max_date = (df["date"].min(), df["date"].max()) if df["timestamp"].notna().any() else (None, None)
+min_date = df["date"].min() if df["date"].notna().any() else None
+max_date = df["date"].max() if df["date"].notna().any() else None
 if min_date and max_date:
-    date_range = st.sidebar.date_input("Date Range", (min_date, max_date))
+    date_range = st.sidebar.date_input("Date range", (min_date, max_date))
 else:
     date_range = None
-top_n = st.sidebar.slider("Top N URLs", 5, 100, 25)
 
-# Apply filters
+unique_agents = sorted(df["_agent_token"].value_counts().index.tolist())
+selected_agents = st.sidebar.multiselect("Agent tokens (filter; leave blank = all)", options=unique_agents, default=[])
+
+content_scope = st.sidebar.selectbox("Scope", ["All URLs", "Content-only (exclude static assets)"], index=1)
+top_n = st.sidebar.slider("Top N (lists)", 5, 100, 25)
+
+# apply filters
 df_f = df.copy()
-if selected_agents:
-    df_f = df_f[df_f["agent_token"].isin(selected_agents)]
-if selected_statuses:
-    df_f = df_f[df_f["status"].isin(selected_statuses)]
-if content_filter == "Content-only (exclude static assets)":
-    df_f = df_f[~df_f["is_static"]]
 if date_range:
     start = pd.Timestamp(date_range[0])
     end = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1)
-    df_f = df_f[(df_f["timestamp"] >= start) & (df_f["timestamp"] < end)]
+    df_f = df_f[(df_f["timestamp"]>=start) & (df_f["timestamp"]<end)]
+if selected_agents:
+    df_f = df_f[df_f["_agent_token"].isin(selected_agents)]
+if content_scope=="Content-only (exclude static assets)":
+    df_f = df_f[~df_f["_is_static"]]
 
-# ----------------------------
-# KPIs
-# ----------------------------
-st.title("Bot & UA Traffic Dashboard")
-c1, c2, c3, c4 = st.columns(4)
+# ---------------------------
+# Metrics (19 items)
+# All enabled per user choice
+# Output layout: top-level KPIs, then detailed sections
+# ---------------------------
+st.header("Key SEO KPIs")
+
+col1, col2, col3, col4, col5 = st.columns(5)
 total_hits = len(df_f)
-bot_hits = df_f["is_bot"].sum()
-unique_urls = df_f["path"].nunique()
-unique_agents = df_f["agent_token"].nunique()
+bot_hits = df_f["_agent_token"].isin(UA_TOKENS).sum()
+static_hits = df_f["_is_static"].sum()
+unique_urls = df_f["_path_only"].nunique()
+unique_agents_count = df_f["_agent_token"].nunique()
 
-c1.metric("Total Hits", f"{total_hits:,}")
-c2.metric("Bot Hits (heuristic)", f"{bot_hits:,}", f"{bot_hits/total_hits*100:.1f}%" if total_hits else "0%")
-c3.metric("Unique URLs", f"{unique_urls:,}")
-c4.metric("Unique Agents", f"{unique_agents:,}")
+col1.metric("Total hits", f"{total_hits:,}")
+col2.metric("Bot-token hits", f"{bot_hits:,}", f"{bot_hits/total_hits*100:.1f}%" if total_hits else "0%")
+col3.metric("Static asset hits", f"{static_hits:,}", f"{static_hits/total_hits*100:.1f}%" if total_hits else "0%")
+col4.metric("Unique URLs", f"{unique_urls:,}")
+col5.metric("Unique agent tokens", f"{unique_agents_count:,}")
 
 st.markdown("---")
 
-# ----------------------------
-# VISUALS
-# ----------------------------
-if not df_f.empty and df_f["timestamp"].notna().any():
-    st.subheader("Traffic Over Time (Hourly)")
-    ts = df_f.groupby([pd.Grouper(key="timestamp", freq="H"), "agent_token"]).size().reset_index(name="hits")
-    fig = px.area(ts, x="timestamp", y="hits", color="agent_token", title="Hourly Traffic by Agent Token")
+# 1) Top Crawled Paths
+st.subheader("1 — Top Crawled Paths")
+top_paths = (df_f.groupby("_path_only")
+             .agg(hits=("_path_only","count"),
+                  bot_hits=("_agent_token", lambda s: s.isin(UA_TOKENS).sum()),
+                  unique_agents=("_agent_token","nunique"),
+                  first_seen=("timestamp","min"),
+                  last_seen=("timestamp","max"))
+             .reset_index().sort_values("hits", ascending=False).head(top_n))
+top_paths["first_seen"] = top_paths["first_seen"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+top_paths["last_seen"] = top_paths["last_seen"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+st.dataframe(top_paths, use_container_width=True)
+
+fig = px.bar(top_paths.sort_values("hits"), x="hits", y="_path_only", orientation="h", title="Top crawled paths")
+st.plotly_chart(fig, use_container_width=True)
+
+# 2) Crawled Sections
+st.subheader("2 — Crawled Sections")
+if df_f["_section"].notna().any() and df_f["_section"].str.strip().replace("","NaN").notna().any():
+    sec = df_f.groupby("_section").agg(hits=("_section","count")).reset_index().sort_values("hits", ascending=False)
+    st.dataframe(sec.head(top_n))
+    fig = px.pie(sec.head(15), names="_section", values="hits", title="Top sections by hits")
     st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("No section data available in log to compute Crawled Sections.")
 
-st.subheader("HTTP Status Codes by Agent Token")
-status_df = df_f.groupby(["status", "agent_token"]).size().reset_index(name="count")
-if not status_df.empty:
-    fig = px.bar(status_df, x="status", y="count", color="agent_token", barmode="group", title="Status Codes by Agent Token")
+# 3) Crawl Frequency by User-Agent token
+st.subheader("3 — Crawl Frequency by Agent Token (Top)")
+freq_agt = df_f.groupby(["_agent_token"]).agg(hits=("_agent_token","count")).reset_index().sort_values("hits", ascending=False)
+st.dataframe(freq_agt.head(50), use_container_width=True)
+fig = px.bar(freq_agt.head(25), x="hits", y="_agent_token", orientation="h", title="Top agent tokens by hits")
+st.plotly_chart(fig, use_container_width=True)
+
+# 4) Crawl Budget Waste (static hits, tracking params)
+st.subheader("4 — Crawl Budget Waste")
+# static hits ratio and hits with tracking-like params (e.g., utm_, gclid, sa=U, ved, usg)
+tracking_pattern = re.compile(r"(utm_|gclid=|fbclid=|_ga=|_gl=|_fbp=|sa=|ved=|usg=)", re.IGNORECASE)
+df_f["_has_tracking_params"] = df_f["_qs"].astype(str).apply(lambda q: bool(tracking_pattern.search(q)))
+waste_stats = {
+    "static_hits": int(df_f["_is_static"].sum()),
+    "tracking_param_hits": int(df_f["_has_tracking_params"].sum()),
+    "distinct_tracked_urls": int(df_f[df_f["_has_tracking_params"]]["_path_only"].nunique())
+}
+st.write(waste_stats)
+fig = px.bar(x=["static_hits","tracking_param_hits"], y=[waste_stats["static_hits"], waste_stats["tracking_param_hits"]],
+             labels={"x":"type","y":"count"}, title="Crawl budget waste (static vs tracking-param hits)")
+st.plotly_chart(fig, use_container_width=True)
+
+# 5) Crawl Depth (unique path segments per agent)
+st.subheader("5 — Crawl Depth Approx (unique pages crawled per agent token)")
+crawl_depth = (df_f.groupby("_agent_token")["_path_only"].nunique().reset_index().rename(columns={"_path_only":"unique_urls"}).sort_values("unique_urls", ascending=False))
+st.dataframe(crawl_depth.head(100), use_container_width=True)
+
+# 6) Query-Parameter Abuse List (many params)
+st.subheader("6 — Query Parameter Abuse (high param counts)")
+param_abuse = df_f[df_f["_qs_count"]>=3].groupby("_path_only").agg(hits=("_path_only","count"), avg_params=("_qs_count","mean")).reset_index().sort_values("hits", ascending=False)
+st.dataframe(param_abuse.head(top_n), use_container_width=True)
+
+# 7) Bot Exposure to Error Codes (4xx/5xx)
+st.subheader("7 — Bot exposure to errors (4xx / 5xx)")
+err_df = df_f[df_f["_status"].str.startswith(("4","5"), na=False)]
+err_by_agent = err_df.groupby(["_agent_token","_status"]).size().reset_index(name="count").sort_values("count", ascending=False)
+st.dataframe(err_by_agent.head(200), use_container_width=True)
+fig = px.bar(err_by_agent.head(50), x="count", y="_agent_token", color="_status", orientation="h", title="Errors by agent token")
+st.plotly_chart(fig, use_container_width=True)
+
+# 8) Orphaned URLs Indicator (bot-only URLs)
+st.subheader("8 — Orphaned URLs (URLs seen only by bots, not humans)")
+# define human as agent token not in UA_TOKENS and not generic 'bot'
+human_mask = ~df_f["_agent_token"].isin(UA_TOKENS) & (df_f["_agent_token"]!="bot")
+human_seen = set(df_f[human_mask]["_path_only"].unique())
+bot_seen = set(df_f[df_f["_agent_token"].isin(UA_TOKENS) | (df_f["_agent_token"]=="bot")]["_path_only"].unique())
+orphaned = sorted(list(bot_seen - human_seen))
+st.write(f"Orphaned URL count: {len(orphaned)} — showing top {top_n}")
+st.dataframe(pd.DataFrame({"path":orphaned[:top_n]}), use_container_width=True)
+
+# 9) Duplicate Content Hits (same pathname different query)
+st.subheader("9 — Duplicate-content risk: same path, many distinct query strings")
+dup_qs = (df_f.groupby("_path_only")
+          .agg(hits=("_path_only","count"),
+               distinct_qs=("_qs","nunique"),
+               distinct_agents=("_agent_token","nunique"))
+          .reset_index().sort_values(["distinct_qs","hits"], ascending=False))
+st.dataframe(dup_qs.head(top_n), use_container_width=True)
+
+# 10) Slow Response Pages (if response time exists)
+st.subheader("10 — Slow Response Pages")
+if "_resp_time" in df_f.columns and df_f["_resp_time"].notna().any():
+    slow = df_f.groupby("_path_only")["_resp_time"].agg(["mean","median","max","count"]).reset_index().sort_values("mean", ascending=False)
+    st.dataframe(slow.head(top_n), use_container_width=True)
+else:
+    st.info("No response-time column detected. Skipping slow response metric.")
+
+# 11) Response Bytes / Load Impact
+st.subheader("11 — Response Bytes (size) impact")
+bytes_stats = df_f.groupby("_path_only")["_bytes"].agg(["sum","mean","count"]).reset_index().sort_values("sum", ascending=False)
+st.dataframe(bytes_stats.head(top_n), use_container_width=True)
+fig = px.bar(bytes_stats.head(25), x="sum", y="_path_only", orientation="h", title="Top URLs by total bytes served")
+st.plotly_chart(fig, use_container_width=True)
+
+# 12) Sessionized Bot Journeys (samples)
+st.subheader("12 — Sessionized Bot Journeys (sample)")
+# show sample sessions for top bot token
+top_bot = df_f[df_f["_agent_token"].isin(UA_TOKENS)]["_agent_token"].value_counts().idxmax() if not df_f[df_f["_agent_token"].isin(UA_TOKENS)].empty else None
+if top_bot:
+    sample_sessions = df_f[df_f["_agent_token"]==top_bot].groupby("_session_id").filter(lambda g: len(g)>=3).groupby("_session_id").head(1)["_session_id"].unique()[:10]
+    sessions_list = []
+    for sid in sample_sessions:
+        srows = df_f[df_f["_session_id"]==sid].sort_values("timestamp")[["_session_id","timestamp","_path_only","_status","_agent_token"]]
+        sessions_list.append(srows)
+    for s in sessions_list:
+        st.dataframe(s, use_container_width=True)
+else:
+    st.info("No bot sessions available for sampling.")
+
+# 13) Sitemap Coverage vs Bot Hits (optional)
+st.subheader("13 — Sitemap coverage vs hits (optional)")
+if sitemap_paths:
+    # compute coverage: which sitemap paths got hits
+    hit_paths = set(df_f["_path_only"].unique())
+    sitemap_in_hits = sorted(list(sitemap_paths & hit_paths))
+    sitemap_not_hit = sorted(list(sitemap_paths - hit_paths))
+    st.write(f"Sitemap URLs total: {len(sitemap_paths)}. In logs: {len(sitemap_in_hits)}. Missing from logs: {len(sitemap_not_hit)}")
+    st.dataframe(pd.DataFrame({"sitemap_hit_sample": sitemap_in_hits[:top_n]}))
+else:
+    st.info("No sitemap uploaded. Skip sitemap coverage metric.")
+
+# 14) Parameter Pattern Clustering (basic)
+st.subheader("14 — Parameter pattern clustering (count of unique param keys top)")
+def param_keys(qs):
+    if not qs:
+        return ""
+    pairs = [p for p in re.split("[&;]", qs) if p]
+    keys = [p.split("=")[0] if "=" in p else p for p in pairs]
+    keys = [k for k in keys if k]
+    keys_sorted = ",".join(sorted(set(keys)))
+    return keys_sorted
+df_f["_param_keys"] = df_f["_qs"].astype(str).apply(param_keys)
+param_pattern = df_f.groupby("_param_keys").agg(hits=("_param_keys","count")).reset_index().sort_values("hits", ascending=False)
+st.dataframe(param_pattern.head(50), use_container_width=True)
+
+# 15) Device/Platform Parsing (mobile/desktop heuristics)
+st.subheader("15 — Device / Platform (mobile vs desktop estimates)")
+def detect_mobile(ua):
+    if not isinstance(ua, str):
+        return False
+    u = ua.lower()
+    return bool(re.search(r"mobile|android|iphone|ipad", u))
+df_f["_is_mobile_est"] = df_f["_user_agent"].apply(detect_mobile)
+mobile_share = df_f["_is_mobile_est"].mean()*100 if len(df_f)>0 else 0
+st.metric("Estimated mobile share", f"{mobile_share:.1f}%")
+mob = df_f.groupby("_is_mobile_est").size().reset_index(name="count")
+fig = px.pie(mob, names="_is_mobile_est", values="count", title="Estimated Mobile vs Desktop (True=mobile)")
+st.plotly_chart(fig, use_container_width=True)
+
+# 16) Section Abuse (sections crawled excessively)
+st.subheader("16 — Section abuse (top sections by hits)")
+if df_f["_section"].notna().any() and df_f["_section"].str.strip().replace("","NaN").notna().any():
+    sec_abuse = df_f.groupby("_section").agg(hits=("_section","count"), unique_urls=("_path_only","nunique")).reset_index().sort_values("hits", ascending=False)
+    st.dataframe(sec_abuse.head(top_n), use_container_width=True)
+else:
+    st.info("Section metadata not available.")
+
+# 17) Heavy Hitters (IPs or agents requesting thousands+ pages)
+st.subheader("17 — Heavy hitters (IPs and agent tokens)")
+top_ips = df_f.groupby("_client_ip").size().reset_index(name="hits").sort_values("hits", ascending=False).head(25)
+st.dataframe(top_ips, use_container_width=True)
+top_agents = df_f.groupby("_agent_token").size().reset_index(name="hits").sort_values("hits", ascending=False).head(50)
+st.dataframe(top_agents, use_container_width=True)
+
+# 18) Status-Class Distribution (2xx/3xx/4xx/5xx)
+st.subheader("18 — Status-class distribution")
+def status_class(s):
+    if not isinstance(s, str) or s=="":
+        return "other"
+    s = s.strip()
+    if s.startswith("2"):
+        return "2xx"
+    if s.startswith("3"):
+        return "3xx"
+    if s.startswith("4"):
+        return "4xx"
+    if s.startswith("5"):
+        return "5xx"
+    return "other"
+df_f["_status_class"] = df_f["_status"].apply(status_class)
+status_summary = df_f.groupby("_status_class").size().reset_index(name="count")
+st.dataframe(status_summary, use_container_width=True)
+fig = px.pie(status_summary, names="_status_class", values="count", title="Status class distribution")
+st.plotly_chart(fig, use_container_width=True)
+
+# 19) Distinct URL Discovery Trend (new URLs over time)
+st.subheader("19 — Distinct URL discovery trend")
+if df_f["timestamp"].notna().any():
+    df_f = df_f.sort_values("timestamp")
+    df_f["_is_new_url"] = ~df_f["_path_only"].duplicated()
+    new_urls = df_f.groupby(pd.Grouper(key="timestamp", freq="D"))["_is_new_url"].sum().reset_index().rename(columns={"_is_new_url":"new_urls"})
+    st.dataframe(new_urls.tail(50), use_container_width=True)
+    fig = px.line(new_urls, x="timestamp", y="new_urls", title="New distinct URLs discovered per day")
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("No status data in filtered set.")
-
-# Top URLs
-st.subheader(f"Top {top_n} URLs by Hits")
-url_stats = (
-    df_f.groupby("path")
-    .agg(
-        hits=("path", "count"),
-        first_seen=("timestamp", "min"),
-        last_seen=("timestamp", "max"),
-        common_status=("status", lambda x: x.mode().iloc[0] if not x.mode().empty else "")
-    )
-    .reset_index()
-    .sort_values("hits", ascending=False)
-    .head(top_n)
-)
-
-# Ensure first_seen/last_seen are datetimes before formatting; safe format
-url_stats["first_seen"] = pd.to_datetime(url_stats["first_seen"], errors="coerce")
-url_stats["last_seen"] = pd.to_datetime(url_stats["last_seen"], errors="coerce")
-url_stats["first_seen_fmt"] = safe_format_datetime(url_stats["first_seen"], "%Y-%m-%d %H:%M")
-url_stats["last_seen_fmt"] = safe_format_datetime(url_stats["last_seen"], "%Y-%m-%d %H:%M")
-
-st.dataframe(url_stats[["path","hits","common_status","first_seen_fmt","last_seen_fmt"]].rename(columns={
-    "first_seen_fmt":"first_seen",
-    "last_seen_fmt":"last_seen"
-}), use_container_width=True)
-
-fig_urls = px.bar(url_stats, x="hits", y="path", orientation="h", title=f"Top {top_n} URLs")
-st.plotly_chart(fig_urls, use_container_width=True)
-
-# Hourly Heatmap
-st.subheader("Hourly Heatmap (Agent Tokens)")
-heat = df_f.groupby(["hour", "agent_token"]).size().reset_index(name="count")
-if not heat.empty:
-    heat_pivot = heat.pivot(index="hour", columns="agent_token", values="count").fillna(0)
-    st.dataframe(heat_pivot)
-    # plotly imshow expects numeric matrix-like; transpose to have agent tokens on y-axis
-    fig_heat = px.imshow(heat_pivot.T, labels=dict(x="Hour", y="Agent Token", color="Hits"), title="Hourly Crawl Intensity (by token)")
-    st.plotly_chart(fig_heat, use_container_width=True)
-else:
-    st.info("No hourly data available for heatmap.")
-
-# Crawl depth proxy
-st.subheader("Crawl Depth & Unique Pages per Agent Token")
-crawl_depth = df_f.groupby("agent_token")["path"].nunique().reset_index().rename(columns={"path":"unique_urls"})
-st.dataframe(crawl_depth.sort_values("unique_urls", ascending=False).head(200), use_container_width=True)
+    st.info("Timestamps not available; cannot compute discovery trend.")
 
 st.markdown("---")
 
-# ----------------------------
-# BASIC HEURISTICS / ANOMALY SIGNALS
-# ----------------------------
-st.subheader("Heuristics & Signals")
-
-# 1) Burst detection by client_ip (requests per second)
-if "client_ip" in df_f.columns and df_f["client_ip"].notna().any():
-    bursts = df_f.groupby("client_ip").agg(
-        hits=("client_ip","count"),
-        unique_paths=("path","nunique"),
-        first_seen=("timestamp","min"),
-        last_seen=("timestamp","max")
-    ).reset_index()
-    bursts["duration_s"] = (bursts["last_seen"] - bursts["first_seen"]).dt.total_seconds().clip(lower=1)
-    bursts["rps"] = bursts["hits"] / bursts["duration_s"]
-    st.markdown("**Top clients by requests/sec**")
-    st.dataframe(bursts.sort_values("rps", ascending=False).head(20)[["client_ip","hits","unique_paths","rps"]], use_container_width=True)
-else:
-    st.info("No client IP column selected; IP heuristics skipped.")
-
-# 2) Agents requesting many distinct URLs
-agent_url_stats = df_f.groupby("agent_token").agg(hits=("agent_token","count"), unique_paths=("path","nunique")).reset_index()
-agent_url_stats["unique_per_hit"] = agent_url_stats["unique_paths"] / agent_url_stats["hits"]
-st.markdown("**Agents with many unique pages (crawler-like)**")
-st.dataframe(agent_url_stats.sort_values("unique_paths", ascending=False).head(50), use_container_width=True)
-
-# 3) Error exposure (4xx/5xx)
-st.markdown("**Bot exposure to errors (4xx/5xx)**")
-err = df_f[df_f["status"].str.startswith(("4","5"), na=False)]
-err_summary = err.groupby(["agent_token","status"]).size().reset_index(name="count").sort_values("count", ascending=False)
-st.dataframe(err_summary, use_container_width=True)
-
-st.markdown("---")
-
-# ----------------------------
-# EXPORT
-# ----------------------------
-st.subheader("Export Filtered Data")
-export_cols = ["timestamp","path","status","user_agent","agent_token","is_static","client_ip"]
-export_cols = [c for c in export_cols if c in df_f.columns]
-df_export = df_f[export_cols].copy()
-df_export["timestamp"] = safe_format_datetime(df_export.get("timestamp", pd.Series()), "%Y-%m-%d %H:%M:%S")
-csv_bytes = df_export.to_csv(index=False).encode("utf-8")
-st.download_button("Download Filtered CSV", csv_bytes, "filtered_bot_data.csv")
+# Exports and utilities
+st.header("Exports & Data")
+exp_col1, exp_col2, exp_col3 = st.columns([2,1,1])
+with exp_col1:
+    st.subheader("Filtered dataset sample")
+    st.dataframe(df_f[["_path_only","_status","_agent_token","_client_ip","timestamp"]].head(200), use_container_width=True)
+with exp_col2:
+    csv = df_f.to_csv(index=False).encode("utf-8")
+    st.download_button("Download filtered CSV", csv, file_name="filtered_logs.csv")
+with exp_col3:
+    try:
+        import pyarrow as pa  # optional
+        buf = io.BytesIO()
+        df_f.to_parquet(buf, index=False)
+        st.download_button("Download Parquet", buf.getvalue(), file_name="filtered_logs.parquet")
+    except Exception:
+        st.info("Install pyarrow for Parquet export (optional).")
 
 st.success("Analysis complete.")
