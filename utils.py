@@ -1,128 +1,126 @@
 # utils.py
 import re
 import pandas as pd
+import numpy as np
 from datetime import datetime
 
+# Signatures lists (extendable)
 BOT_SIGNATURES = [
-    "GPTBot", "ChatGPT", "ChatGPT-User", "OAI-SearchBot", "PerplexityBot",
-    "Perplexity", "Claude", "ClaudeBot", "Claude-Searchbot", "CCBot",
-    "Bytespider", "Bingbot", "Googlebot", "Mistral", "Bard", "bingpreview",
-    "DuckDuckBot", "Yandex", "Sogou"
+    "gptbot", "gpt-4o", "chatgpt-user", "openai", "oai-searchbot", "perplexity", "perplexitybot",
+    "claude", "claudebot", "anthropic", "mistral", "bytespider", "ccbot", "serpapi",
+    "copilot", "bingbot", "googlebot", "yandex", "duckduckbot", "baiduspider", "slurp",
+    "ahrefsbot", "semrushbot", "bingpreview", "sogou", "curl", "wget", "python-requests"
 ]
 
 AI_SEARCH_SIGNALS = {
-    "training": ["GPTBot", "Bytespider", "CCBot"],
-    "search": ["OAI-SearchBot", "PerplexityBot", "Claude-Searchbot", "BingPreview"],
-    "user": ["ChatGPT-User", "Perplexity-User", "Claude-User", "Mistral-User", "ChatGPT"]
+    "training": ["gptbot", "bytespider", "ccbot"],
+    "search": ["oai-searchbot", "perplexitybot", "claude-searchbot", "bingpreview"],
+    "user": ["chatgpt-user", "perplexity-user", "claude-user", "mistral-user"]
 }
 
+# --- Column guessing ---
 def guess_columns(columns):
-    # heuristic mapping for common log exports
     names = {c.lower(): c for c in columns}
     out = {}
-    for keyword in ["time", "timestamp", "date", "datetime", "ts"]:
-        for c in columns:
-            if keyword in c.lower():
-                out["timestamp"] = c
-                break
-        if out.get("timestamp"):
-            break
-    for keyword in ["useragent", "user_agent", "agent", "ua"]:
-        for c in columns:
-            if keyword in c.lower():
-                out["user_agent"] = c
-                break
-        if out.get("user_agent"):
-            break
-    for keyword in ["url", "uri", "path", "request", "page"]:
-        for c in columns:
-            if keyword in c.lower():
-                out["path"] = c
-                break
-        if out.get("path"):
-            break
-    for keyword in ["status", "http_status", "code"]:
-        for c in columns:
-            if keyword in c.lower():
-                out["status"] = c
-                break
-        if out.get("status"):
-            break
-    for keyword in ["ip", "clientip", "remote_addr"]:
-        for c in columns:
-            if keyword in c.lower():
-                out["ip"] = c
-                break
-        if out.get("ip"):
-            break
-    for keyword in ["bytes", "size", "response_size", "content_length"]:
-        for c in columns:
-            if keyword in c.lower():
-                out["bytes"] = c
-                break
-        if out.get("bytes"):
-            break
-    for keyword in ["resp", "response", "latency", "time_taken"]:
-        for c in columns:
-            if keyword in c.lower():
-                out["response_time"] = c
-                break
-        if out.get("response_time"):
-            break
+    def find_any(keywords):
+        for kw in keywords:
+            for c in columns:
+                if kw in c.lower():
+                    return c
+        return None
+    out["timestamp"] = find_any(["time","timestamp","date","datetime","ts","logtime"])
+    out["user_agent"] = find_any(["useragent","user_agent","ua","agent"])
+    out["path"] = find_any(["url","uri","path","request","page"])
+    out["status"] = find_any(["status","http_status","code","response_code"])
+    out["ip"] = find_any(["ip","clientip","remote_addr","remote"])
+    out["bytes"] = find_any(["bytes","size","response_size","content_length"])
+    out["section"] = find_any(["section","area","site_section"])
     return out
 
+# --- Timestamp parsing ---
 def parse_timestamp_column(df, col):
-    # robust parsing attempts: ISO, epoch (ms or s), common formats
-    s = df[col].copy()
-    # epoch detection
+    # Attempts multiple robust parsing strategies and writes df["timestamp"]
+    s = df[col]
+    # numeric epoch detection
     try:
-        # if numeric-ish and large values: treat as epoch ms or s
-        if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s) or s.dropna().astype(str).str.match(r'^\d{9,}$').all():
-            # convert column to numeric
-            s_num = pd.to_numeric(s, errors="coerce")
-            # heuristics: > 1e12 => ms, > 1e9 => s
-            if (s_num > 1e12).any():
-                df["timestamp"] = pd.to_datetime(s_num, unit="ms", errors="coerce")
+        numeric_like = pd.to_numeric(s, errors="coerce")
+        if numeric_like.notna().any():
+            # heuristics: > 1e12 -> ms, > 1e9 -> s
+            if (numeric_like > 1e12).any():
+                df["timestamp"] = pd.to_datetime(numeric_like, unit="ms", errors="coerce", utc=True)
+            elif (numeric_like > 1e9).any():
+                df["timestamp"] = pd.to_datetime(numeric_like, unit="s", errors="coerce", utc=True)
             else:
-                df["timestamp"] = pd.to_datetime(s_num, unit="s", errors="coerce")
-            # If conversion produced many NaNs, try parsing as string next
-            if df["timestamp"].isna().mean() > 0.5:
-                df["timestamp"] = pd.to_datetime(df[col], errors="coerce", utc=None)
+                # fallback to string parse
+                df["timestamp"] = pd.to_datetime(s, errors="coerce", utc=True, infer_datetime_format=True)
         else:
-            df["timestamp"] = pd.to_datetime(df[col], errors="coerce", utc=None)
+            df["timestamp"] = pd.to_datetime(s, errors="coerce", utc=True, infer_datetime_format=True)
     except Exception:
-        df["timestamp"] = pd.to_datetime(df[col], errors="coerce", utc=None)
-    # fallback: if still NaT, try common formats
+        df["timestamp"] = pd.to_datetime(s, errors="coerce", utc=True, infer_datetime_format=True)
+
+    # fallback common CLF format if all NaT
     if df["timestamp"].isna().all():
-        tried = False
         for fmt in ("%d/%b/%Y:%H:%M:%S %z", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
             try:
-                df["timestamp"] = pd.to_datetime(df[col], format=fmt, errors="coerce")
+                df["timestamp"] = pd.to_datetime(s, format=fmt, errors="coerce", utc=True)
                 if df["timestamp"].notna().any():
-                    tried = True
                     break
             except Exception:
                 pass
-        if not tried:
-            # last resort parse
-            df["timestamp"] = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
+    # final fallback - infer
+    if df["timestamp"].isna().all():
+        df["timestamp"] = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+
     return df
 
+def normalize_timestamp_series(series):
+    # Ensure timezone-naive (UTC) datetimes for uniform grouping; keep NaT
+    s = pd.to_datetime(series, errors="coerce", utc=True)
+    # convert to naive (drop tzinfo)
+    return s.dt.tz_convert(None)
+
+# --- User-Agent classification ---
 def classify_user_agent(ua):
     if not isinstance(ua, str) or ua.strip() == "":
         return "unknown"
     ua_l = ua.lower()
-    # priority ai-specific patterns
-    for k, sigs in AI_SEARCH_SIGNALS.items():
+    # ai-search/user priority
+    for kind, sigs in AI_SEARCH_SIGNALS.items():
         for s in sigs:
             if s.lower() in ua_l:
-                return f"ai_search_{k}"
+                return f"ai_search_{kind}"
     # known bot signatures
     for s in BOT_SIGNATURES:
-        if s.lower() in ua_l:
+        if s in ua_l:
+            # return the canonical signature
             return s
-    # generic bot detection heuristics
-    if re.search(r"(bot|spider|crawler|crawl|scraper|wget|curl|python-requests)", ua_l):
+    # generic heuristics
+    if re.search(r"(bot|spider|crawler|scraper|wget|curl|python-requests)", ua_l):
         return "bot_other"
-    # else assume human / normal browser
-    return "human"
+    # else assume human/browser
+    # add detection for common browser strings to improve label
+    if re.search(r"(mozilla|chrome|safari|edge|firefox)", ua_l):
+        return "human"
+    return "unknown"
+
+# --- static detection ---
+def detect_static_path(path, extensions=None, regex=None):
+    if not isinstance(path, str) or path.strip() == "":
+        return False
+    p = path.split("?",1)[0].lower()
+    if extensions:
+        for ext in extensions:
+            e = ext.strip().lower()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            if p.endswith(e):
+                return True
+    if regex:
+        try:
+            if re.search(regex, p):
+                return True
+        except Exception:
+            pass
+    return False
