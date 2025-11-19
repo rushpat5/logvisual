@@ -11,7 +11,11 @@ from datetime import datetime
 # -----------------------------------------------------------------------------
 # 1. CONFIG & STYLING
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="SEO Log Analyzer Pro", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="SEO Log Analyzer Pro", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
 # Custom CSS for "Pro" look
 st.markdown("""
@@ -38,9 +42,6 @@ st.markdown("""
     /* Tabs */
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; border-radius: 4px 4px 0 0; gap: 1px; padding-top: 10px; padding-bottom: 10px; }
-    
-    /* Charts */
-    .js-plotly-plot .plotly .modebar { orientation: v; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -50,12 +51,12 @@ st.markdown("""
 
 # Enhanced Bot Categories
 BOT_MAP = {
-    "Google": ["googlebot", "mediapartners-google", "adsbot-google"],
+    "Google": ["googlebot", "mediapartners-google", "adsbot-google", "google-inspectiontool"],
     "Bing/MS": ["bingbot", "bingpreview", "msnbot"],
-    "AI & LLMs": ["gptbot", "chatgpt-user", "oai-searchbot", "claude", "anthropic", "perplexity", "ccbot", "bytespider", "mistral"],
-    "SEO Tools": ["ahrefsbot", "semrushbot", "dotbot", "mj12bot", "rogerbot", "screamingfrog", "sitebulb"],
+    "AI & LLMs": ["gptbot", "chatgpt-user", "oai-searchbot", "claude", "anthropic", "perplexity", "ccbot", "bytespider", "mistral", "applebot-extended"],
+    "SEO Tools": ["ahrefsbot", "semrushbot", "dotbot", "mj12bot", "rogerbot", "screamingfrog", "sitebulb", "serpstatbot"],
     "Social": ["facebookexternalhit", "twitterbot", "linkedinbot", "pinterest", "slackbot"],
-    "Other Bots": ["yandex", "baiduspider", "duckduckbot", "sogou", "exabot", "slurp", "curl", "wget", "python-requests", "spider", "crawl"]
+    "Other Bots": ["yandex", "baiduspider", "duckduckbot", "sogou", "exabot", "slurp", "curl", "wget", "python-requests", "spider", "crawl", "headless"]
 }
 
 def categorize_agent(ua_string):
@@ -71,12 +72,12 @@ def categorize_agent(ua_string):
             if token in ua:
                 return (category, token)
     
-    # 2. Check browsers
-    if "mozilla" in ua and any(x in ua for x in ["chrome", "safari", "firefox", "edge"]):
+    # 2. Check browsers (Basic heuristic)
+    if "mozilla" in ua and any(x in ua for x in ["chrome", "safari", "firefox", "edge", "opera"]):
         return ("Browser/Human", "Browser")
         
     # 3. Generic Fallback
-    if "bot" in ua or "crawl" in ua:
+    if "bot" in ua or "crawl" in ua or "spider" in ua:
         return ("Other Bots", "Generic Bot")
         
     return ("Unknown", "Unknown")
@@ -105,8 +106,7 @@ def load_and_process_data(file_content):
         return None, f"Error reading file: {e}"
 
     # 2. Column Mapping (Smart Guessing)
-    col_map = {}
-    cols_lower = [c.lower() for c in df.columns]
+    cols_lower = [str(c).lower() for c in df.columns]
     
     def find_col(keywords):
         for k in keywords:
@@ -115,39 +115,59 @@ def load_and_process_data(file_content):
                     return df.columns[i]
         return None
 
+    # Map common log column names
+    col_map = {}
     col_map['ts'] = find_col(["time", "date", "timestamp", "ts"])
-    col_map['url'] = find_col(["request", "url", "path", "uri"])
-    col_map['status'] = find_col(["status", "code", "sc-status"])
-    col_map['ua'] = find_col(["user-agent", "user_agent", "ua", "agent"])
-    col_map['method'] = find_col(["method", "verb"])
-    col_map['size'] = find_col(["bytes", "size", "sc-bytes"])
-    # Optional: Response time
-    col_map['time_taken'] = find_col(["time-taken", "duration", "ms", "response_time"])
+    col_map['url'] = find_col(["request", "url", "path", "uri", "location"])
+    col_map['status'] = find_col(["status", "code", "sc-status", "return_code"])
+    col_map['ua'] = find_col(["user-agent", "user_agent", "ua", "agent", "client"])
+    col_map['size'] = find_col(["bytes", "size", "sc-bytes", "length"])
 
     if not col_map['ts'] or not col_map['url']:
-        return None, "Could not auto-detect 'Timestamp' or 'URL' columns. Please ensure headers exist."
+        return None, f"Could not auto-detect 'Timestamp' or 'URL' columns. Found columns: {list(df.columns)}"
 
     # 3. Normalize Data
-    # Timestamp
-    df['timestamp'] = pd.to_datetime(df[col_map['ts']], errors='coerce', utc=True)
-    if df['timestamp'].isna().mean() > 0.9: # If conversion failed, try manual formats
-         for fmt in ["%d/%b/%Y:%H:%M:%S", "%Y-%m-%d %H:%M:%S"]:
+    # Timestamp parsing (Robust)
+    try:
+        # Try numeric first (Unix timestamp)
+        if pd.to_numeric(df[col_map['ts']], errors='coerce').notna().all():
+             # Guess logic: > 10^11 is usually milliseconds, else seconds
+             sample = pd.to_numeric(df[col_map['ts']], errors='coerce').mean()
+             unit = 'ms' if sample > 1e11 else 's'
+             df['timestamp'] = pd.to_datetime(pd.to_numeric(df[col_map['ts']], errors='coerce'), unit=unit, utc=True)
+        else:
+             df['timestamp'] = pd.to_datetime(df[col_map['ts']], errors='coerce', utc=True)
+    except:
+        df['timestamp'] = pd.to_datetime(df[col_map['ts']], errors='coerce', utc=True)
+        
+    # Fallback for common log formats if auto-parser failed mostly
+    if df['timestamp'].isna().mean() > 0.8:
+        for fmt in ["%d/%b/%Y:%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S"]:
             try:
                 df['timestamp'] = pd.to_datetime(df[col_map['ts']], format=fmt, errors='coerce', utc=True)
-                if df['timestamp'].notna().any(): break
+                if df['timestamp'].notna().mean() > 0.5: break
             except: pass
-    
+
+    # Drop rows without valid timestamp
+    df = df.dropna(subset=['timestamp'])
+
     # Clean URL
     df['full_path'] = df[col_map['url']].astype(str)
-    # Remove method if included in path (common in raw logs like 'GET /foo HTTP/1.1')
-    df['full_path'] = df['full_path'].apply(lambda x: x.split(' ')[1] if len(x.split(' ')) > 1 and x.startswith(('GET', 'POST')) else x)
+    # Cleaning "GET /path HTTP/1.1" patterns if present
+    df['full_path'] = df['full_path'].apply(lambda x: x.split(' ')[1] if len(x.split(' ')) > 1 and x.startswith(('GET', 'POST', 'HEAD')) else x)
     
     # Feature Engineering
     df['path_clean'] = df['full_path'].apply(lambda x: x.split('?')[0].split('#')[0])
     df['query_string'] = df['full_path'].apply(lambda x: x.split('?')[1] if '?' in x else "")
     df['has_params'] = df['query_string'].str.len() > 0
-    df['status'] = pd.to_numeric(df[col_map['status']], errors='coerce').fillna(0).astype(int)
-    df['status_cls'] = (df['status'] // 100).astype(str) + "xx"
+    
+    # Status Code
+    if col_map['status']:
+        df['status'] = pd.to_numeric(df[col_map['status']], errors='coerce').fillna(0).astype(int)
+    else:
+        df['status'] = 200 # Default if missing
+        
+    df['status_cls'] = df['status'].apply(lambda x: f"{x // 100}xx" if x > 0 else "Unknown")
     
     # UA Classification
     ua_col = col_map.get('ua')
@@ -163,7 +183,7 @@ def load_and_process_data(file_content):
     df['is_static'] = df['path_clean'].str.lower().str.endswith(static_exts)
     
     # Sections (Top directory)
-    df['section'] = df['path_clean'].apply(lambda x: x.strip('/').split('/')[0] if len(x.strip('/').split('/')) > 0 else 'Root')
+    df['section'] = df['path_clean'].apply(lambda x: x.strip('/').split('/')[0] if len(x.strip('/').split('/')) > 0 else 'Home')
     
     # Dates
     df['date'] = df['timestamp'].dt.date
@@ -192,15 +212,6 @@ def kpi_card(col, title, value, delta=None, delta_txt=""):
     """
     col.markdown(html, unsafe_allow_html=True)
 
-def plot_sparkline(df_ts):
-    """Simple sparkline for dashboard"""
-    if df_ts.empty: return None
-    fig = px.area(df_ts, x='date', y='count', template="plotly_dark")
-    fig.update_traces(line_color='#ff4b4b', fill_color='rgba(255, 75, 75, 0.2)')
-    fig.update_layout(showlegend=False, margin=dict(l=0,r=0,t=0,b=0), height=80, 
-                      xaxis=dict(visible=False), yaxis=dict(visible=False))
-    return fig
-
 # -----------------------------------------------------------------------------
 # 5. MAIN APP LAYOUT
 # -----------------------------------------------------------------------------
@@ -214,7 +225,8 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Upload Log File (CSV/TSV)", type=['csv', 'tsv', 'txt'])
     
     if uploaded_file:
-        df_raw, error = load_and_process_data(uploaded_file)
+        with st.spinner("Processing logs..."):
+            df_raw, error = load_and_process_data(uploaded_file)
         
         if error:
             st.error(error)
@@ -226,12 +238,18 @@ with st.sidebar:
         st.header("2. Filters")
         
         # Date Filter
-        min_date, max_date = df_raw['date'].min(), df_raw['date'].max()
-        date_range = st.date_input("Date Range", [min_date, max_date], min_value=min_date, max_value=max_date)
+        if not df_raw.empty:
+            min_date, max_date = df_raw['date'].min(), df_raw['date'].max()
+            date_range = st.date_input("Date Range", [min_date, max_date], min_value=min_date, max_value=max_date)
+        else:
+            st.stop()
         
         # Bot Filter
         all_cats = sorted(df_raw['bot_category'].unique())
-        sel_cats = st.multiselect("Bot Categories", all_cats, default=[c for c in all_cats if c != "Browser/Human"])
+        # Default to everything except browsers for clearer analysis
+        default_cats = [c for c in all_cats if c != "Browser/Human"]
+        if not default_cats: default_cats = all_cats # fallback
+        sel_cats = st.multiselect("Bot Categories", all_cats, default=default_cats)
         
         # Status Filter
         all_status = sorted(df_raw['status_cls'].unique())
@@ -255,6 +273,10 @@ with st.sidebar:
         st.info("Upload a file to begin.")
         st.stop()
 
+if df.empty:
+    st.warning("No data matches the selected filters.")
+    st.stop()
+
 # TABS LAYOUT
 tab_overview, tab_budget, tab_status, tab_ai, tab_explorer = st.tabs([
     "📊 Executive Dashboard", 
@@ -272,16 +294,16 @@ with tab_overview:
     total_hits = len(df)
     unique_urls = df['path_clean'].nunique()
     error_hits = len(df[df['status'] >= 400])
-    error_rate = (error_hits / total_hits * 100) if total_hits > 0 else 0
+    error_rate = (error_hits / total_hits * 100) if total_hits > 0 else 0.0
     
-    # Calculate simple delta (vs first half of period) - rudimentary but effective visual
+    # Calculate simple delta (vs first half of period)
     midpoint = df['timestamp'].min() + (df['timestamp'].max() - df['timestamp'].min()) / 2
-    prev_period = df[df['timestamp'] < midpoint]
-    curr_period = df[df['timestamp'] >= midpoint]
+    prev_period_count = len(df[df['timestamp'] < midpoint])
+    curr_period_count = len(df[df['timestamp'] >= midpoint])
     
-    hits_delta = len(curr_period) - len(prev_period)
+    hits_delta = curr_period_count - prev_period_count
     
-    kpi_card(c1, "Total Bot Hits", f"{total_hits:,}", hits_delta, "vs prev period")
+    kpi_card(c1, "Total Hits (Filtered)", f"{total_hits:,}", hits_delta, "vs prev period")
     kpi_card(c2, "Unique URLs Crawled", f"{unique_urls:,}")
     kpi_card(c3, "Error Rate (4xx/5xx)", f"{error_rate:.2f}%", -error_rate, "lower is better")
     kpi_card(c4, "Active Bot Agents", f"{df['bot_name'].nunique()}", None)
@@ -292,14 +314,19 @@ with tab_overview:
     with col_main:
         st.subheader("Crawl Volume Over Time")
         # Resample for trend
-        ts_data = df.set_index('timestamp').resample('H').size().reset_index(name='hits')
-        fig_trend = px.area(ts_data, x='timestamp', y='hits', title="Hourly Crawl Volume", template="plotly_dark", color_discrete_sequence=['#4DA6FF'])
-        st.plotly_chart(fig_trend, use_container_width=True)
+        if not df.empty:
+            ts_data = df.set_index('timestamp').resample('H').size().reset_index(name='hits')
+            fig_trend = px.area(ts_data, x='timestamp', y='hits', title="Hourly Crawl Volume", template="plotly_dark", color_discrete_sequence=['#4DA6FF'])
+            st.plotly_chart(fig_trend, use_container_width=True)
         
     with col_side:
         st.subheader("Bot Category Share")
+        # --- FIX: Use value_counts and explicit column names for px.pie ---
         pie_data = df['bot_category'].value_counts().reset_index()
-        fig_pie = px.donut(pie_data, names='bot_category', values='count', hole=0.4, template="plotly_dark")
+        pie_data.columns = ['bot_category', 'count']
+        
+        # --- FIX: Use px.pie with hole argument instead of px.donut ---
+        fig_pie = px.pie(pie_data, names='bot_category', values='count', hole=0.4, template="plotly_dark")
         st.plotly_chart(fig_pie, use_container_width=True)
 
     # Actionable Insights Generator
@@ -307,15 +334,19 @@ with tab_overview:
     insights = []
     if error_rate > 5:
         insights.append(f"🔴 **Critical:** Error rate is high ({error_rate:.1f}%). Check the 'Status & Errors' tab immediately.")
-    if df['has_params'].mean() > 0.3:
-        insights.append(f"🟠 **Warning:** 30%+ of crawled URLs have query parameters. Ensure these aren't wasting crawl budget.")
+    
+    param_ratio = df['has_params'].mean()
+    if param_ratio > 0.3:
+        insights.append(f"🟠 **Warning:** {param_ratio*100:.1f}% of crawled URLs have query parameters. Ensure these aren't wasting crawl budget.")
+        
     if "Google" in df['bot_category'].values:
         g_hits = len(df[df['bot_category']=="Google"])
-        if g_hits < 100:
-            insights.append("🟡 **Observation:** Googlebot activity is very low. Check if the site is new or blocked.")
-    if "AI & LLMs" in df['bot_category'].unique():
-        ai_hits = len(df[df['bot_category']=="AI & LLMs"])
-        insights.append(f"🔵 **Info:** AI Bots (GPT/Claude) made {ai_hits:,} requests. Check the 'AI Intelligence' tab.")
+        if g_hits < 50:
+            insights.append("🟡 **Observation:** Googlebot activity is very low in this filtered view.")
+            
+    ai_count = len(df[df['bot_category']=="AI & LLMs"])
+    if ai_count > 0:
+        insights.append(f"🔵 **Info:** AI Bots (GPT/Claude) made {ai_count:,} requests. Check the 'AI Intelligence' tab.")
 
     if insights:
         for i in insights: st.markdown(i)
@@ -330,17 +361,21 @@ with tab_budget:
     
     with c1:
         st.subheader("Top Sections Crawled")
-        section_counts = df['section'].value_counts().head(10)
-        fig_sec = px.bar(section_counts, orientation='h', title="Hits by Site Section", template="plotly_dark")
+        section_counts = df['section'].value_counts().head(10).reset_index()
+        section_counts.columns = ['section', 'count']
+        fig_sec = px.bar(section_counts, x='count', y='section', orientation='h', title="Hits by Site Section", template="plotly_dark")
+        fig_sec.update_layout(yaxis={'categoryorder':'total ascending'})
         st.plotly_chart(fig_sec, use_container_width=True)
         
     with c2:
         st.subheader("Waste Analysis: Parameters")
         param_df = df[df['has_params']]
         if not param_df.empty:
-            # Group by parameter keys (naive split)
-            param_hits = param_df.groupby('path_clean').size().reset_index(name='hits').sort_values('hits', ascending=False).head(10)
-            fig_param = px.bar(param_hits, x='hits', y='path_clean', title="Top Parametrized URLs (Potential Trap)", template="plotly_dark", color_discrete_sequence=['#FF9900'])
+            # Group by clean path to see which URL generates most parameter variations
+            param_hits = param_df['path_clean'].value_counts().head(10).reset_index()
+            param_hits.columns = ['path_clean', 'hits']
+            fig_param = px.bar(param_hits, x='hits', y='path_clean', title="Top URLs with Parameters (Potential Trap)", template="plotly_dark", color_discrete_sequence=['#FF9900'])
+            fig_param.update_layout(yaxis={'categoryorder':'total ascending'})
             st.plotly_chart(fig_param, use_container_width=True)
         else:
             st.info("No parametrized URLs found in filtered data.")
@@ -358,9 +393,16 @@ with tab_status:
         st.subheader("Status Code Breakdown")
         status_counts = df['status'].value_counts().reset_index()
         status_counts.columns = ['status', 'count']
-        status_counts['color'] = status_counts['status'].apply(lambda x: 'red' if x >= 400 else ('green' if x < 300 else 'orange'))
+        # Color mapping
+        def get_color(code):
+            if code >= 500: return 'red'
+            if code >= 400: return 'orange'
+            if code >= 300: return 'blue'
+            return 'green'
+            
+        status_counts['color_group'] = status_counts['status'].apply(get_color)
         
-        fig_status = px.bar(status_counts, x='status', y='count', color='color', title="Response Codes Distribution", template="plotly_dark")
+        fig_status = px.bar(status_counts, x='status', y='count', color='color_group', title="Response Codes Distribution", template="plotly_dark")
         st.plotly_chart(fig_status, use_container_width=True)
 
     with col_err_2:
@@ -374,16 +416,19 @@ with tab_status:
     err_df = df[df['status'] >= 400].copy()
     if not err_df.empty:
         heatmap_data = err_df.groupby(['day_name', 'hour']).size().reset_index(name='count')
-        # Ensure sorting
+        
+        # Sort days correctly
         days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
         heatmap_data['day_name'] = pd.Categorical(heatmap_data['day_name'], categories=days_order, ordered=True)
+        heatmap_data = heatmap_data.sort_values(['day_name', 'hour'])
         
         fig_heat = px.density_heatmap(heatmap_data, x='hour', y='day_name', z='count', nbinsx=24, 
                                       title="Error Intensity by Day & Hour", template="plotly_dark", color_continuous_scale="Viridis")
         st.plotly_chart(fig_heat, use_container_width=True)
         
         st.subheader("Top Broken Links (404s)")
-        top_404 = df[df['status'] == 404]['path_clean'].value_counts().head(10).reset_index(name='hits')
+        top_404 = df[df['status'] == 404]['path_clean'].value_counts().head(10).reset_index()
+        top_404.columns = ['path', 'hits']
         st.dataframe(top_404, use_container_width=True)
     else:
         st.success("Great! No 4xx/5xx errors detected in the filtered data.")
@@ -393,16 +438,19 @@ with tab_ai:
     st.markdown("### Who is crawling you? (Google vs AI vs Tools)")
     
     # Pivot table for Bot Category over time
-    pivot_bots = df.groupby([pd.Grouper(key='timestamp', freq='H'), 'bot_category']).size().reset_index(name='hits')
-    fig_bots = px.line(pivot_bots, x='timestamp', y='hits', color='bot_category', title="Bot Activity Trends", template="plotly_dark")
-    st.plotly_chart(fig_bots, use_container_width=True)
+    if not df.empty:
+        pivot_bots = df.groupby([pd.Grouper(key='timestamp', freq='H'), 'bot_category']).size().reset_index(name='hits')
+        fig_bots = px.line(pivot_bots, x='timestamp', y='hits', color='bot_category', title="Bot Activity Trends", template="plotly_dark")
+        st.plotly_chart(fig_bots, use_container_width=True)
     
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("AI Scraper Analysis")
         ai_df = df[df['bot_category'] == "AI & LLMs"]
         if not ai_df.empty:
-            fig_ai = px.bar(ai_df['bot_name'].value_counts().reset_index(), x='bot_name', y='count', 
+            ai_counts = ai_df['bot_name'].value_counts().reset_index()
+            ai_counts.columns = ['bot_name', 'count']
+            fig_ai = px.bar(ai_counts, x='bot_name', y='count', 
                             title="Top AI Bots (Training & Search)", template="plotly_dark", color_discrete_sequence=['#00cc96'])
             st.plotly_chart(fig_ai, use_container_width=True)
             st.info("💡 **Tip:** Use `robots.txt` to block `GPTBot` if you don't want your content used for LLM training.")
@@ -413,14 +461,16 @@ with tab_ai:
         st.subheader("SEO Tool Activity")
         tool_df = df[df['bot_category'] == "SEO Tools"]
         if not tool_df.empty:
-            st.dataframe(tool_df['bot_name'].value_counts(), use_container_width=True)
+            tool_counts = tool_df['bot_name'].value_counts().reset_index()
+            tool_counts.columns = ['bot_name', 'count']
+            st.dataframe(tool_counts, use_container_width=True)
         else:
             st.write("No SEO tool activity detected.")
 
 # --- TAB 5: DATA EXPLORER ---
 with tab_explorer:
     st.subheader("Raw Data Inspector")
-    st.dataframe(df[['timestamp', 'status', 'bot_name', 'method', 'full_path']].sort_values('timestamp', ascending=False), use_container_width=True)
+    st.dataframe(df[['timestamp', 'status', 'bot_name', 'full_path']].sort_values('timestamp', ascending=False), use_container_width=True)
     
     st.download_button(
         label="Download Filtered Data (CSV)",
